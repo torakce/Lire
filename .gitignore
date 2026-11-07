@@ -1,0 +1,5 @@
+# sorties de compilation et dépendances téléchargées par build.sh
+build/
+deps/
+*.o
+*.exe
