@@ -6,11 +6,17 @@
  *    display list MuPDF. Les rendus suivants rejouent cette liste, ce qui évite
  *    de ré-interpréter le PDF à chaque zoom.
  *  - L'affichage est découpé en tuiles de 512 px rendues en parallèle par
- *    plusieurs threads, uniquement pour la zone visible (+ une couronne
- *    d'anticipation), au facteur de zoom EXACT de l'écran (rendu net).
+ *    plusieurs threads. Les tuiles sont calculées sur une grille de niveaux
+ *    alignée sur les crans de la molette (x1,26) : un cran de molette tombe
+ *    pile sur un niveau déjà calculé, et revenir en arrière ne recalcule rien.
+ *  - Une fois la zone visible nette, on anticipe en tâche de fond : couronne
+ *    autour de l'écran, cran de zoom suivant et précédent, puis le reste de la
+ *    page (dans la limite d'un budget mémoire proportionnel à la RAM).
  *  - Pendant un zoom, la carte graphique ré-étire instantanément ce qui est
  *    déjà calculé, puis les tuiles nettes arrivent au fur et à mesure. Les rendus
  *    devenus inutiles sont interrompus immédiatement (fz_cookie.abort).
+ *  - Toutes les pages sont analysées en tâche de fond (plusieurs threads, chacun
+ *    avec sa propre instance du document), la page affichée en premier.
  *  - Onglets : chaque document (Tab) garde son état complet (zoom, position,
  *    rotation, cache). Les threads ne travaillent que pour l'onglet affiché ;
  *    un onglet mis en arrière-plan conserve juste ce qui était à l'écran, d'où
@@ -32,13 +38,13 @@
 #include <string.h>
 
 #define TILE 512
-#define LPO 256                    /* niveaux de zoom par octave (pas de 0,27 %) */
-#define ZSTEP (LPO / 3.0)          /* un cran de molette = x1,26 */
+#define LPO 768                    /* niveaux de zoom par octave (pas de 0,09 %) */
+#define GRID 256                   /* un cran de molette = 2^(1/3) = x1,26 ; grille des niveaux de rendu */
 #define PREVIEW_MAX 1024           /* côté max de l'aperçu basse résolution */
-#define MAX_WORKERS 16
-#define HASH_SIZE 4096
-#define TEX_BUDGET ((size_t)384 << 20)   /* mémoire graphique pour les tuiles de l'onglet actif */
-#define MAX_LISTS 8                /* display lists gardées hors des pages visibles */
+#define MAX_WORKERS 32
+#define MAX_LOADERS 3
+#define HASH_SIZE 8192
+#define TILE_BYTES ((size_t)TILE * TILE * 4)
 #define MAX_CLOSED 20              /* historique des onglets fermés (Ctrl+Maj+T) */
 #define PREVIEW_LEVEL INT_MIN
 #define BG_COLOR 0x3c3f43
@@ -65,6 +71,7 @@ struct Job {
 	void *tex;
 	size_t bytes;
 	unsigned used;          /* dernière génération de planification où il était utile */
+	unsigned vis_gen;       /* dernière génération où il était à l'écran */
 	double key;             /* priorité (plus petit = plus urgent) */
 	Job *hnext, *dnext;
 	Job *pnext, *pprev;     /* chaînage des jobs prêts d'une page */
@@ -81,13 +88,20 @@ typedef struct {
 	fz_cookie lcookie;
 	fz_rect lbounds;        /* limites réelles mesurées au chargement de la page */
 	int bounds_differ;
+	int urgent;             /* page visible (à analyser avant les autres) */
+	size_t lbytes;          /* mémoire de la display list */
 	Job *ready;
 } Page;
 
 struct Tab {
-	fz_document *doc;
+	fz_document *doc;                  /* utilisé par le thread principal et le chargeur 0 */
+	fz_document *ldoc[MAX_LOADERS];    /* instances supplémentaires pour les autres chargeurs */
+	int ldoc_tried[MAX_LOADERS];
+	char *password;
 	char *path, *name;
 	int need_password;
+	int exact_level;                   /* niveau rendu tel quel (page entière, 100 %…) hors grille */
+	size_t list_bytes;
 	Page *pages;
 	int npages;
 	double max_page_dim;
@@ -119,13 +133,15 @@ static lire_mutex fzmu[FZ_LOCK_MAX];
 
 static lire_mutex mu;
 static lire_cond cv_work, cv_load, cv_idle;
-static lire_thread th_loader, th_workers[MAX_WORKERS];
-static fz_context *wctx[MAX_WORKERS], *lctx;
-static int nworkers;
+static lire_thread th_loader[MAX_LOADERS], th_workers[MAX_WORKERS];
+static fz_context *wctx[MAX_WORKERS], *lctx[MAX_LOADERS];
+static int nworkers, nloaders;
 static int quit, paused;
-static int nrunning, loader_busy, loader_page = -1, resched;
-static Tab *loader_tab;
+static int nrunning, loader_busy[MAX_LOADERS], loader_page[MAX_LOADERS], resched;
+static Tab *loader_tab[MAX_LOADERS];
 static Job *running[MAX_WORKERS];
+static size_t tex_budget = (size_t)384 << 20;   /* mémoire graphique des tuiles (onglet actif) */
+static size_t list_budget = (size_t)512 << 20;  /* mémoire des pages analysées (onglet actif) */
 static JobVec wq, wq_next;
 static int wq_pos;
 static Job *done_head;
@@ -186,6 +202,20 @@ static void set_toast(const char *msg)
 }
 
 static double level_scale(int L) { return exp2((double)L / LPO); }
+static int floor_div(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
+static int grid_floor(int L) { return floor_div(L, GRID) * GRID; }
+static int grid_ceil(int L) { return -grid_floor(-L); }
+
+/* Niveau auquel on calcule les tuiles pour afficher le niveau L : le niveau de la
+   grille juste au-dessus (affiché réduit de 0 à 21 %, donc net), sauf pour un
+   niveau « exact » (page entière, 100 %, zoom sur une zone) rendu tel quel. */
+static int render_level(Tab *t, int L)
+{
+	int R;
+	if (L == t->exact_level) return L;
+	R = grid_ceil(L);
+	return R > t->max_level ? L : R;
+}
 static fz_matrix view_ctm(int r, double s) { return fz_concat(fz_rotate((float)r), fz_scale((float)s, (float)s)); }
 static fz_irect page_pbox(Page *p, int r, double s) { return fz_round_rect(fz_transform_rect(p->bounds, view_ctm(r, s))); }
 static fz_rect rotated_bounds(Page *p, int r) { return fz_transform_rect(p->bounds, fz_rotate((float)r)); }
@@ -282,13 +312,19 @@ static void job_free(Job *j)
 	free(j);
 }
 
+/* boîte de la page en pixels au niveau L */
+static fz_irect level_pbox(Tab *t, Page *p, int L)
+{
+	return L == t->level ? p->pbox : page_pbox(p, t->rot, level_scale(L));
+}
+
 static Job *get_tile(Tab *t, int i, int L, int tx, int ty)
 {
 	Job *j = hget(t, i, L, tx, ty);
 	if (j->scale == 0) {
 		Page *p = &t->pages[i];
 		double s = level_scale(L);
-		fz_irect pb = (L == t->level) ? p->pbox : page_pbox(p, t->rot, s);
+		fz_irect pb = level_pbox(t, p, L);
 		j->scale = s;
 		j->ctm = view_ctm(t->rot, s);
 		j->rect.x0 = pb.x0 + tx * TILE;
@@ -402,6 +438,11 @@ static void worker_main(void *arg)
 	mutex_unlock(&mu);
 }
 
+#ifdef LIRE_STOCK_MUPDF
+/* MuPDF sans les correctifs de Lire (banc de test sur la version système) : estimation */
+static size_t fz_display_list_memory(fz_context *c, fz_display_list *l) { (void)c; return l ? (size_t)8 << 20 : 0; }
+#endif
+
 static fz_display_list *build_list(fz_context *c, fz_document *d, int i, fz_cookie *cookie, fz_rect *bounds)
 {
 	fz_page *page = NULL;
@@ -429,34 +470,95 @@ static fz_display_list *build_list(fz_context *c, fz_document *d, int i, fz_cook
 	return list;
 }
 
+/* Autre instance du même fichier, pour analyser des pages en parallèle
+   (un fz_document ne peut servir qu'à un thread à la fois). */
+static fz_document *open_extra(fz_context *c, const char *path, const char *pw, int npages)
+{
+	fz_document *d = NULL;
+	fz_var(d);
+	fz_try(c) {
+		d = fz_open_document(c, path);
+		if (fz_needs_password(c, d) && !(pw && fz_authenticate_password(c, d, pw)))
+			fz_throw(c, FZ_ERROR_GENERIC, "mot de passe");
+		if (fz_count_pages(c, d) != npages)   /* fichier remplacé entre-temps */
+			fz_throw(c, FZ_ERROR_GENERIC, "fichier modifie");
+	}
+	fz_catch(c) {
+		fz_drop_document(c, d);
+		d = NULL;
+	}
+	return d;
+}
+
+/* (sous mu) prochaine page en attente d'analyse, sans la retirer de la file */
+static int queued_page(Tab *t)
+{
+	int k;
+	for (k = t->lq_pos; k < t->nlq; k++)
+		if (t->lq[k] < t->npages && t->pages[t->lq[k]].lstate == L_QUEUED) return 1;
+	return 0;
+}
+
+static int any_loader_busy(void)
+{
+	int k;
+	for (k = 0; k < nloaders; k++)
+		if (loader_busy[k]) return 1;
+	return 0;
+}
+
 static void loader_main(void *arg)
 {
-	(void)arg;
+	int k = (int)(intptr_t)arg;
+	fz_context *c = lctx[k];
 	mutex_lock(&mu);
 	while (!quit) {
 		Tab *t = T;
 		int i = -1;
 		Page *p;
 		fz_display_list *list;
+		fz_document *d;
 		fz_rect lb;
-		if (!paused && t && t->doc && !t->need_password)
-			while (t->lq_pos < t->nlq) {
-				int k = t->lq[t->lq_pos++];
-				if (k < t->npages && t->pages[k].lstate == L_QUEUED) { i = k; break; }
-			}
-		if (i < 0) { cond_wait(&cv_load, &mu); continue; }
+		if (paused || !t || !t->doc || t->need_password || !t->pages || !queued_page(t)) {
+			cond_wait(&cv_load, &mu);
+			continue;
+		}
+		d = k == 0 ? t->doc : t->ldoc[k];
+		if (!d) {
+			char *path, *pw;
+			int n;
+			if (t->ldoc_tried[k]) { cond_wait(&cv_load, &mu); continue; }
+			/* première fois que ce chargeur travaille pour cet onglet : il ouvre sa propre instance */
+			t->ldoc_tried[k] = 1;
+			loader_busy[k] = 1;
+			loader_tab[k] = t;
+			loader_page[k] = -1;
+			path = t->path;
+			pw = t->password;
+			n = t->npages;
+			mutex_unlock(&mu);
+			d = open_extra(c, path, pw, n);
+			mutex_lock(&mu);
+			t->ldoc[k] = d;          /* l'onglet ne peut pas disparaître pendant ce temps (quiesce attend) */
+			loader_busy[k] = 0;
+			loader_tab[k] = NULL;
+			cond_broadcast(&cv_idle);
+			continue;
+		}
+		while (t->lq_pos < t->nlq) {
+			int q = t->lq[t->lq_pos++];
+			if (q < t->npages && t->pages[q].lstate == L_QUEUED) { i = q; break; }
+		}
+		if (i < 0) continue;
 		p = &t->pages[i];
 		p->lstate = L_BUILDING;
 		memset(&p->lcookie, 0, sizeof p->lcookie);
-		loader_busy = 1;
-		loader_page = i;
-		loader_tab = t;
+		loader_busy[k] = 1;
+		loader_page[k] = i;
+		loader_tab[k] = t;
 		lb = p->bounds;
-		{
-			fz_document *d = t->doc;
-			mutex_unlock(&mu);
-			list = build_list(lctx, d, i, &p->lcookie, &lb);
-		}
+		mutex_unlock(&mu);
+		list = build_list(c, d, i, &p->lcookie, &lb);
 
 		mutex_lock(&mu);
 		if (list && !p->lcookie.abort && !fz_is_empty_rect(lb) &&
@@ -465,14 +567,16 @@ static void loader_main(void *arg)
 			p->lbounds = lb;
 			p->bounds_differ = 1;
 		}
-		loader_busy = 0;
-		loader_page = -1;
-		loader_tab = NULL;
+		loader_busy[k] = 0;
+		loader_page[k] = -1;
+		loader_tab[k] = NULL;
 		if (p->lcookie.abort) {
-			fz_drop_display_list(lctx, list);
+			fz_drop_display_list(c, list);
 			p->lstate = L_NONE;
 		} else if (list) {
 			p->list = list;
+			p->lbytes = fz_display_list_memory(c, list);
+			t->list_bytes += p->lbytes;
 			p->lstate = L_READY;
 		} else {
 			p->lstate = L_ERROR;
@@ -484,6 +588,16 @@ static void loader_main(void *arg)
 		mutex_lock(&mu);
 	}
 	mutex_unlock(&mu);
+}
+
+/* (sous mu) libère la display list d'une page */
+static void drop_list(Tab *t, Page *p)
+{
+	fz_drop_display_list(ctx, p->list);
+	p->list = NULL;
+	t->list_bytes -= p->lbytes;
+	p->lbytes = 0;
+	p->lstate = L_NONE;
 }
 
 /* (sous mu) vide la file du chargeur d'un onglet */
@@ -516,8 +630,9 @@ static void quiesce(void)
 	if (T && T->lq) clear_lq(T);
 	for (k = 0; k < nworkers; k++)
 		if (running[k]) running[k]->cookie.abort = 1;
-	if (loader_tab && loader_page >= 0) loader_tab->pages[loader_page].lcookie.abort = 1;
-	while (nrunning > 0 || loader_busy)
+	for (k = 0; k < nloaders; k++)
+		if (loader_tab[k] && loader_page[k] >= 0) loader_tab[k]->pages[loader_page[k]].lcookie.abort = 1;
+	while (nrunning > 0 || any_loader_busy())
 		cond_wait(&cv_idle, &mu);
 	mutex_unlock(&mu);
 }
@@ -540,7 +655,8 @@ static void stop_tab_work(Tab *t)
 	if (t->lq) clear_lq(t);
 	for (k = 0; k < nworkers; k++)
 		if (running[k] && running[k]->tab == t) running[k]->cookie.abort = 1;
-	if (loader_tab == t && loader_page >= 0) t->pages[loader_page].lcookie.abort = 1;
+	for (k = 0; k < nloaders; k++)
+		if (loader_tab[k] == t && loader_page[k] >= 0) t->pages[loader_page[k]].lcookie.abort = 1;
 	mutex_unlock(&mu);
 }
 
@@ -553,18 +669,14 @@ static void trim_tab(Tab *t)
 		Job *j = t->htab[h];
 		while (j) {
 			Job *next = j->hnext;
-			if (j->used != t->last_gen && (j->state == J_READY || j->state == J_IDLE || j->state == J_FAILED))
+			if (j->vis_gen != t->last_gen && (j->state == J_READY || j->state == J_IDLE || j->state == J_FAILED))
 				job_free(j);
 			j = next;
 		}
 	}
 	for (i = 0; i < t->npages; i++) {
 		Page *p = &t->pages[i];
-		if (p->lstate == L_READY && p->lused != t->last_gen) {
-			fz_drop_display_list(ctx, p->list);
-			p->list = NULL;
-			p->lstate = L_NONE;
-		}
+		if (p->lstate == L_READY && !(p->lused == t->last_gen && p->urgent)) drop_list(t, p);
 	}
 	mutex_unlock(&mu);
 }
@@ -607,11 +719,22 @@ static void tab_clear(Tab *t)
 	free(t->pages);
 	t->pages = NULL;
 	t->npages = 0;
+	t->list_bytes = 0;
 	free(t->lq); free(t->lq_old);
 	t->lq = t->lq_old = NULL;
 	t->nlq = t->nlq_old = t->lq_pos = 0;
+	for (i = 1; i < MAX_LOADERS; i++) {
+		fz_drop_document(ctx, t->ldoc[i]);
+		t->ldoc[i] = NULL;
+		t->ldoc_tried[i] = 0;
+	}
 	fz_drop_document(ctx, t->doc);
 	t->doc = NULL;
+	if (t->password) {
+		memset(t->password, 0, strlen(t->password));
+		free(t->password);
+		t->password = NULL;
+	}
 	t->need_password = 0;
 }
 
@@ -747,6 +870,7 @@ static void apply_fit(int mode, int i, int keep_position)
 	if (mode == FIT_PAGE) {
 		s = fmin((vw - 2.0 * gap) / w, (vh - 2.0 * gap) / h);
 		set_level((int)floor(LPO * log2(fmax(s, 1e-6))));
+		t->exact_level = t->level;
 		center_on_page(i);
 	} else {
 		s = (vw - 2.0 * gap - sbw) / w;
@@ -756,6 +880,7 @@ static void apply_fit(int mode, int i, int keep_position)
 			set_level((int)floor(LPO * log2(fmax(s, 1e-6))));
 			t->sy = p->top - gap;
 		}
+		t->exact_level = t->level;
 		t->sx = p->left + p->pw / 2.0 - vw / 2.0;
 		clamp_scroll();
 	}
@@ -770,11 +895,21 @@ static void goto_page(int i)
 	else center_on_page(i);
 }
 
+/* Zoom par crans (molette, +/-) : on se cale sur la grille des niveaux de rendu,
+   pour que chaque cran tombe sur des tuiles déjà calculées ou anticipées.
+   Un défilement fractionnaire (pavé tactile) zoome librement. */
 static void zoom_step(double steps, double x, double y)
 {
+	int L, n;
 	if (!has_doc()) return;
 	T->fit_mode = FIT_NONE;
-	zoom_at((int)lround(T->level + steps * ZSTEP), x, y);
+	L = T->level;
+	n = (int)lround(steps);
+	if (n != 0 && fabs(steps - n) < 1e-3)
+		L = n > 0 ? grid_floor(L) + n * GRID : grid_ceil(L) + n * GRID;
+	else
+		L = (int)lround(L + steps * GRID);
+	zoom_at(L, x, y);
 }
 
 /* Remet la vue d'un onglet en accord avec la fenêtre (taille / DPI changés pendant qu'il était caché). */
@@ -808,30 +943,86 @@ static void sync_view(void)
 
 /* ---------- planification ---------- */
 
-static int tile_range(Page *p, int ring, int *tx0, int *ty0, int *tx1, int *ty1)
+/* Tuiles du niveau L couvrant la partie de la page p visible à l'écran, élargie
+   de mx, my pixels d'écran de chaque côté. 0 si rien n'est concerné. */
+static int tiles_for(Tab *t, Page *p, int L, double mx, double my, int *tx0, int *ty0, int *tx1, int *ty1)
 {
-	double X = p->left - floor(T->sx), Y = p->top - floor(T->sy);
-	int vx0 = (int)fmax(0, -X), vx1 = (int)fmin(p->pw, vw - X);
-	int vy0 = (int)fmax(0, -Y), vy1 = (int)fmin(p->ph, vh - Y);
-	int nx = (p->pw - 1) / TILE, ny = (p->ph - 1) / TILE;
-	if (vx0 >= vx1 || vy0 >= vy1) return 0;
-	*tx0 = clampi(vx0 / TILE - ring, 0, nx);
-	*tx1 = clampi((vx1 - 1) / TILE + ring, 0, nx);
-	*ty0 = clampi(vy0 / TILE - ring, 0, ny);
-	*ty1 = clampi((vy1 - 1) / TILE + ring, 0, ny);
+	double X = p->left - floor(t->sx), Y = p->top - floor(t->sy);
+	double u0 = fmax(0, -X - mx), u1 = fmin(p->pw, vw - X + mx);
+	double v0 = fmax(0, -Y - my), v1 = fmin(p->ph, vh - Y + my);
+	double k = L == t->level ? 1 : level_scale(L) / t->scale;
+	fz_irect pb = level_pbox(t, p, L);
+	int nx = (pb.x1 - pb.x0 - 1) / TILE, ny = (pb.y1 - pb.y0 - 1) / TILE;
+	if (u0 >= u1 || v0 >= v1 || pb.x1 <= pb.x0 || pb.y1 <= pb.y0) return 0;
+	*tx0 = clampi((int)floor(((u0 + p->pbox.x0) * k - pb.x0) / TILE), 0, nx);
+	*tx1 = clampi((int)floor(((u1 + p->pbox.x0) * k - pb.x0 - 1e-3) / TILE), 0, nx);
+	*ty0 = clampi((int)floor(((v0 + p->pbox.y0) * k - pb.y0) / TILE), 0, ny);
+	*ty1 = clampi((int)floor(((v1 + p->pbox.y0) * k - pb.y0 - 1e-3) / TILE), 0, ny);
 	return 1;
 }
+
+/* distance (pixels d'écran) entre le centre d'une tuile du niveau L et le centre de la vue */
+static double tile_dist(Tab *t, Page *p, int L, fz_irect pb, int tx, int ty)
+{
+	double k = L == t->level ? 1 : level_scale(L) / t->scale;
+	double X = p->left - floor(t->sx), Y = p->top - floor(t->sy);
+	double x = X + (pb.x0 + (tx + 0.5) * TILE) / k - p->pbox.x0;
+	double y = Y + (pb.y0 + (ty + 0.5) * TILE) / k - p->pbox.y0;
+	return hypot(x - vw * 0.5, y - vh * 0.5);
+}
+
+static size_t want_bytes;   /* mémoire des tuiles voulues dans la passe en cours */
 
 static void want(Job *j, double key)
 {
 	if (j->used == gen) {           /* déjà demandé dans cette passe : on garde la priorité la plus forte */
 		if (key < j->key) j->key = key;
+		if (key < 2e9) j->vis_gen = gen;
 		return;
 	}
 	j->used = gen;
-	if (j->state == J_IDLE || j->state == J_QUEUED) {
-		j->key = key;
-		jv_push(&wq_next, j);
+	j->key = key;
+	if (key < 2e9) j->vis_gen = gen;
+	if (j->state == J_FAILED) return;
+	want_bytes += j->bytes ? j->bytes : TILE_BYTES;
+	if (j->state == J_IDLE || j->state == J_QUEUED) jv_push(&wq_next, j);
+}
+
+typedef struct { Job *j; double d; } Cand;
+static Cand *cands;
+static int ncand, cand_cap;
+
+static int cmp_cand(const void *a, const void *b)
+{
+	double x = ((const Cand *)a)->d, y = ((const Cand *)b)->d;
+	return x < y ? -1 : x > y;
+}
+
+/* Anticipation : tuiles du niveau L autour de la vue (marge mx, my), des plus
+   proches aux plus lointaines, tant que le budget le permet. */
+static void want_area(Tab *t, int i, int L, double mx, double my, double base, size_t limit)
+{
+	Page *p = &t->pages[i];
+	fz_irect pb;
+	int a0, b0, a1, b1, tx, ty, k;
+	if (want_bytes >= limit || !tiles_for(t, p, L, mx, my, &a0, &b0, &a1, &b1)) return;
+	pb = level_pbox(t, p, L);
+	ncand = 0;
+	for (ty = b0; ty <= b1; ty++)
+		for (tx = a0; tx <= a1; tx++) {
+			if (ncand == cand_cap) {
+				cand_cap = cand_cap ? cand_cap * 2 : 1024;
+				cands = realloc(cands, cand_cap * sizeof *cands);
+			}
+			cands[ncand].j = NULL;
+			cands[ncand].d = tile_dist(t, p, L, pb, tx, ty);
+			cands[ncand].j = (Job *)(intptr_t)(ty * (a1 - a0 + 1) + (tx - a0));   /* indice, résolu après le tri */
+			ncand++;
+		}
+	if (ncand > 1) qsort(cands, ncand, sizeof *cands, cmp_cand);
+	for (k = 0; k < ncand && want_bytes < limit; k++) {
+		int idx = (int)(intptr_t)cands[k].j;
+		want(get_tile(t, i, L, a0 + idx % (a1 - a0 + 1), idx / (a1 - a0 + 1)), base + cands[k].d);
 	}
 }
 
@@ -841,21 +1032,27 @@ static int cmp_key(const void *a, const void *b)
 	return x < y ? -1 : x > y;
 }
 
+static int evict_R;
+
 static int cmp_used(const void *a, const void *b)
 {
 	const Job *x = *(Job *const *)a, *y = *(Job *const *)b;
 	int dx, dy;
 	if (x->used != y->used) return x->used < y->used ? -1 : 1;
 	/* à âge égal, on libère d'abord les niveaux éloignés du zoom courant */
-	dx = abs(x->level - T->level);
-	dy = abs(y->level - T->level);
+	dx = abs(x->level - evict_R);
+	dy = abs(y->level - evict_R);
 	return dx > dy ? -1 : dx < dy;
 }
 
+static int evict_cur;
+
 static int cmp_lused(const void *a, const void *b)
 {
-	unsigned x = T->pages[*(const int *)a].lused, y = T->pages[*(const int *)b].lused;
-	return x < y ? -1 : x > y;
+	const Page *x = &T->pages[*(const int *)a], *y = &T->pages[*(const int *)b];
+	int dx = abs(*(const int *)a - evict_cur), dy = abs(*(const int *)b - evict_cur);
+	if (x->lused != y->lused) return x->lused < y->lused ? -1 : 1;
+	return dx > dy ? -1 : dx < dy;
 }
 
 static void evict(void)
@@ -863,29 +1060,28 @@ static void evict(void)
 	static Job **cand;
 	static int ccap;
 	Tab *t = T;
-	int h, n = 0, k, nready = 0;
+	int h, n = 0, k;
 
-	/* display lists */
-	for (k = 0; k < t->npages; k++)
-		if (t->pages[k].lstate == L_READY) nready++;
-	if (nready > MAX_LISTS) {
-		int *idx = malloc(nready * sizeof *idx), m = 0;
-		for (k = 0; k < t->npages; k++)
-			if (t->pages[k].lstate == L_READY && t->pages[k].lused != gen) idx[m++] = k;
+	/* pages analysées : au-delà du budget, on libère les plus anciennes et les plus
+	   éloignées de la page courante (jamais celles qui sont à l'écran) */
+	if (t->list_bytes > list_budget) {
+		int *idx = malloc(t->npages * sizeof *idx), m = 0;
+		evict_cur = current_page();
+		for (k = 0; k < t->npages; k++) {
+			Page *p = &t->pages[k];
+			if (p->lstate == L_READY && !(p->lused == gen && p->urgent)) idx[m++] = k;
+		}
 		if (m > 1) qsort(idx, m, sizeof *idx, cmp_lused);
 		mutex_lock(&mu);
-		for (k = 0; k < m && nready > MAX_LISTS; k++, nready--) {
-			Page *p = &t->pages[idx[k]];
-			fz_drop_display_list(ctx, p->list);
-			p->list = NULL;
-			p->lstate = L_NONE;
-		}
+		for (k = 0; k < m && t->list_bytes > list_budget / 100 * 85; k++)
+			drop_list(t, &t->pages[idx[k]]);
 		mutex_unlock(&mu);
 		free(idx);
 	}
 
 	/* tuiles */
-	if (t->tex_bytes <= TEX_BUDGET && t->njobs < 2000) return;
+	if (t->tex_bytes <= tex_budget && t->njobs < 40000) return;
+	evict_R = render_level(t, t->level);
 	if (ccap < t->njobs) { ccap = t->njobs * 2; cand = realloc(cand, ccap * sizeof *cand); }
 	mutex_lock(&mu);
 	for (h = 0; h < HASH_SIZE; h++) {
@@ -898,22 +1094,41 @@ static void evict(void)
 	for (k = 0; k < n; k++) {
 		Job *j = cand[k];
 		if (j->state != J_READY) job_free(j);
-		else if (t->tex_bytes > TEX_BUDGET * 0.8) job_free(j);
+		else if (t->tex_bytes > tex_budget / 10 * 8) job_free(j);
 	}
 	mutex_unlock(&mu);
 }
 
+/* (sous mu) met une page dans la file d'analyse */
+static void queue_page(Tab *t, int i, int urgent)
+{
+	Page *p = &t->pages[i];
+	p->lused = gen;
+	p->urgent = urgent;
+	if (p->lstate == L_NONE) p->lstate = L_QUEUED;
+	if (p->lstate == L_QUEUED) t->lq[t->nlq++] = i;
+}
+
 static void schedule(void)
 {
+	static int *order;
+	static int ocap;
 	Tab *t = T;
-	int first, last, i, k, cur, *tmp;
+	int first, last, i, k, cur, *tmp, n = 0, nvis, d, R, up, dn, all_ready = 1;
 	double cx = vw * 0.5, cy = vh * 0.5;
+	size_t limit = tex_budget / 10 * 7;
 	if (!has_doc() || vw <= 0 || vh <= 0) return;
 	gen++;
 	t->last_gen = gen;
 	wq_next.n = 0;
+	want_bytes = 0;
 	visible_range(&first, &last);
 	cur = clampi(current_page(), first, last);
+	R = render_level(t, t->level);
+	up = grid_floor(t->level) + GRID;      /* niveau d'un cran de molette en avant / en arrière */
+	dn = grid_ceil(t->level) - GRID;
+	if (up > t->max_level) up = INT_MIN;
+	if (dn < t->min_level) dn = INT_MIN;
 
 	mutex_lock(&mu);
 	tmp = t->lq_old; t->lq_old = t->lq; t->lq = tmp;
@@ -921,61 +1136,99 @@ static void schedule(void)
 	t->nlq = t->lq_pos = 0;
 
 	/* pages visibles, de la plus centrale vers l'extérieur, puis les voisines */
-	{
-		static int *order;
-		static int ocap;
-		int n = 0, d;
-		if (ocap < t->npages + 4) { ocap = t->npages + 4; order = realloc(order, ocap * sizeof *order); }
-		order[n++] = cur;
-		for (d = 1; cur - d >= first || cur + d <= last; d++) {
-			if (cur + d <= last) order[n++] = cur + d;
-			if (cur - d >= first) order[n++] = cur - d;
+	if (ocap < t->npages + 8) { ocap = t->npages + 8; order = realloc(order, ocap * sizeof *order); }
+	order[n++] = cur;
+	for (d = 1; cur - d >= first || cur + d <= last; d++) {
+		if (cur + d <= last) order[n++] = cur + d;
+		if (cur - d >= first) order[n++] = cur - d;
+	}
+	nvis = n;
+	if (last + 1 < t->npages) order[n++] = last + 1;
+	if (first - 1 >= 0) order[n++] = first - 1;
+
+	/* passe 1 : analyse des pages, tuiles visibles et couronne, pages voisines */
+	for (k = 0; k < n; k++) {
+		Page *p;
+		Job *pj;
+		int visible, a0, b0, a1, b1, r0, s0, r1, s1, tx, ty, has_fb;
+		double X, Y, pdist;
+		fz_irect pb;
+		i = order[k];
+		p = &t->pages[i];
+		queue_page(t, i, 1);
+		if (p->lstate != L_READY) {
+			if (k < nvis && p->lstate != L_ERROR) all_ready = 0;
+			continue;
 		}
-		if (last + 1 < t->npages) order[n++] = last + 1;
-		if (first - 1 >= 0) order[n++] = first - 1;
-		for (k = 0; k < n; k++) {
-			Page *p;
-			Job *pj;
-			int visible, a0, b0, a1, b1, r0, s0, r1, s1, tx, ty, has_fb, urgent;
-			double X, Y, pdist;
-			i = order[k];
-			p = &t->pages[i];
-			p->lused = gen;
-			if (p->lstate == L_NONE) p->lstate = L_QUEUED;
-			if (p->lstate == L_QUEUED) t->lq[t->nlq++] = i;
-			if (p->lstate != L_READY) continue;
-			visible = i >= first && i <= last;
-			X = p->left - floor(t->sx);
-			Y = p->top - floor(t->sy);
-			pdist = hypot(X + p->pw / 2.0 - cx, Y + p->ph / 2.0 - cy);
-			/* page qui tient entièrement à l'écran (visible ou voisine) : on la pré-calcule
-			   en entier au zoom courant, en basse priorité -> Page suivante instantané */
+		visible = k < nvis;
+		X = p->left - floor(t->sx);
+		Y = p->top - floor(t->sy);
+		pdist = hypot(X + p->pw / 2.0 - cx, Y + p->ph / 2.0 - cy);
+		pb = level_pbox(t, p, R);
+		if (!visible) {
+			/* page voisine qui tiendra entièrement à l'écran : calculée en entier -> Page suivante instantané */
 			if (p->pw <= vw && p->ph <= vh) {
-				int nx = (p->pw - 1) / TILE, ny = (p->ph - 1) / TILE;
+				int nx = (pb.x1 - pb.x0 - 1) / TILE, ny = (pb.y1 - pb.y0 - 1) / TILE;
 				for (ty = 0; ty <= ny; ty++)
 					for (tx = 0; tx <= nx; tx++)
-						want(get_tile(t, i, t->level, tx, ty), 5e9 + pdist + (ty * (nx + 1) + tx));
+						want(get_tile(t, i, R, tx, ty), 2.5e9 + pdist + (ty * (nx + 1) + tx));
 			}
-			if (!visible) continue;
-			/* Aperçu basse résolution : seulement si on est zoomé bien au-delà de sa
-			   résolution et qu'on n'a rien d'autre à étirer en attendant les tuiles.
-			   (Sur un plan très chargé, l'aperçu coûte autant qu'un rendu complet.) */
-			pj = hfind(t, i, PREVIEW_LEVEL, 0, 0);
-			has_fb = (pj && (pj->state == J_READY || pj->state == J_DONE)) || p->ready != NULL;
-			if (!pj && !has_fb) pj = get_preview(t, i);
-			if (pj) {
-				urgent = !has_fb && t->scale > pj->scale * 1.5;
-				if (urgent) want(pj, pdist);
+			continue;
+		}
+		/* Aperçu basse résolution : seulement si on est zoomé bien au-delà de sa
+		   résolution et qu'on n'a rien d'autre à étirer en attendant les tuiles. */
+		pj = hfind(t, i, PREVIEW_LEVEL, 0, 0);
+		has_fb = (pj && (pj->state == J_READY || pj->state == J_DONE)) || p->ready != NULL;
+		if (!pj && !has_fb) pj = get_preview(t, i);
+		if (pj && !has_fb && level_scale(R) > pj->scale * 1.5) want(pj, pdist);
+		if (!tiles_for(t, p, R, 0, 0, &a0, &b0, &a1, &b1)) continue;
+		tiles_for(t, p, R, TILE, TILE, &r0, &s0, &r1, &s1);
+		for (ty = s0; ty <= s1; ty++)
+			for (tx = r0; tx <= r1; tx++) {
+				int inview = tx >= a0 && tx <= a1 && ty >= b0 && ty <= b1;
+				want(get_tile(t, i, R, tx, ty), (inview ? 1e9 : 2e9) + tile_dist(t, p, R, pb, tx, ty));
 			}
-			if (!tile_range(p, 0, &a0, &b0, &a1, &b1)) continue;
-			tile_range(p, 1, &r0, &s0, &r1, &s1);
-			for (ty = s0; ty <= s1; ty++)
-				for (tx = r0; tx <= r1; tx++) {
-					Job *tj = get_tile(t, i, t->level, tx, ty);
-					double dd = hypot(X + tx * TILE + TILE / 2.0 - cx, Y + ty * TILE + TILE / 2.0 - cy);
-					int inview = tx >= a0 && tx <= a1 && ty >= b0 && ty <= b1;
-					want(tj, (inview ? 1e9 : 3e9) + dd);
-				}
+	}
+
+	/* passe 2 : crans de zoom voisins sur la zone visible (en arrière, la zone s'élargit) */
+	for (k = 0; k < nvis; k++) {
+		i = order[k];
+		if (t->pages[i].lstate != L_READY) continue;
+		if (dn != INT_MIN && dn != R) want_area(t, i, dn, vw * 0.15, vh * 0.15, 3e9, limit);
+		if (up != INT_MIN && up != R) want_area(t, i, up, 0, 0, 3.5e9, limit);
+	}
+
+	/* passe 3 : le reste de la page au niveau courant (déplacements), dans le budget */
+	for (k = 0; k < nvis && want_bytes < limit; k++) {
+		int a = vw / TILE + 2, b = vh / TILE + 2, m = 0;
+		size_t room = (limit - want_bytes) / TILE_BYTES;
+		i = order[k];
+		if (t->pages[i].lstate != L_READY) continue;
+		while (m < 64 && (size_t)((a + 2 * (m + 1)) * (b + 2 * (m + 1)) - a * b) <= room) m++;
+		if (m > 0) want_area(t, i, R, (double)m * TILE, (double)m * TILE, 5e9, limit);
+	}
+
+	/* passe 4 : analyse de toutes les autres pages en tâche de fond, des plus proches
+	   aux plus lointaines, tant que la mémoire des pages analysées le permet */
+	if (all_ready) {
+		size_t est, sum = t->list_bytes;
+		int nready = 0;
+		for (k = 0; k < t->npages; k++)
+			if (t->pages[k].lstate == L_READY) nready++;
+		est = nready ? t->list_bytes / nready : (size_t)16 << 20;
+		for (d = 1; d < t->npages; d++) {
+			int side;
+			for (side = 0; side < 2; side++) {
+				Page *p;
+				i = side ? cur - d : cur + d;
+				if (i < 0 || i >= t->npages) continue;
+				p = &t->pages[i];
+				if (p->lused == gen) continue;
+				if (p->lstate == L_READY) { p->lused = gen; p->urgent = 0; continue; }
+				if (p->lstate == L_ERROR || sum + est > list_budget / 10 * 7) continue;
+				queue_page(t, i, 0);
+				sum += est;
+			}
 		}
 	}
 
@@ -984,8 +1237,23 @@ static void schedule(void)
 		Page *p = &t->pages[t->lq_old[k]];
 		if (p->lstate == L_QUEUED && p->lused != gen) p->lstate = L_NONE;
 	}
-	if (loader_tab == t && loader_page >= 0 && t->pages[loader_page].lused != gen)
-		t->pages[loader_page].lcookie.abort = 1;
+	{
+		int need = 0, idle = 0;
+		for (k = 0; k < t->nlq; k++)
+			if (t->pages[t->lq[k]].urgent && t->pages[t->lq[k]].lstate == L_QUEUED) need++;
+		for (k = 0; k < nloaders; k++) {
+			if (!loader_busy[k]) idle++;
+			else if (loader_tab[k] == t && loader_page[k] >= 0 && t->pages[loader_page[k]].lused != gen)
+				t->pages[loader_page[k]].lcookie.abort = 1;
+		}
+		/* une page à l'écran attend alors que tous les chargeurs analysent des pages
+		   lointaines : on en interrompt (elles seront reprises plus tard) */
+		for (k = 0; k < nloaders && need > idle; k++)
+			if (loader_busy[k] && loader_tab[k] == t && loader_page[k] >= 0 && !t->pages[loader_page[k]].urgent) {
+				t->pages[loader_page[k]].lcookie.abort = 1;
+				need--;
+			}
+	}
 
 	/* nouvelle file de travail */
 	for (k = wq_pos; k < wq.n; k++)
@@ -997,7 +1265,7 @@ static void schedule(void)
 	for (k = 0; k < nworkers; k++)
 		if (running[k] && running[k]->used != gen) running[k]->cookie.abort = 1;
 	cond_broadcast(&cv_work);
-	cond_signal(&cv_load);
+	cond_broadcast(&cv_load);
 	mutex_unlock(&mu);
 
 	evict();
@@ -1029,6 +1297,16 @@ int core_poll(void)
 	done_head = NULL;
 	mutex_unlock(&mu);
 	if (relayout) sync_view();
+	/* les tuiles à l'écran d'abord, l'anticipation ensuite */
+	if (list && list->dnext) {
+		static JobVec dv;
+		Job *j;
+		dv.n = 0;
+		for (j = list; j; j = j->dnext) jv_push(&dv, j);
+		qsort(dv.v, dv.n, sizeof *dv.v, cmp_key);
+		for (k = 0; k < dv.n; k++) dv.v[k]->dnext = k + 1 < dv.n ? dv.v[k + 1] : NULL;
+		list = dv.v[0];
+	}
 	while (list) {
 		Job *j = list;
 		list = j->dnext;
@@ -1072,7 +1350,7 @@ int core_busy(void)
 {
 	int busy, k;
 	mutex_lock(&mu);
-	busy = nrunning > 0 || loader_busy || done_head != NULL || resched;
+	busy = nrunning > 0 || any_loader_busy() || done_head != NULL || resched;
 	for (k = wq_pos; !busy && k < wq.n; k++)
 		if (wq.v[k]->state == J_QUEUED) busy = 1;
 	if (T && T->lq)
@@ -1085,18 +1363,19 @@ int core_busy(void)
 /* 1 si toutes les tuiles visibles sont nettes (pour les mesures et l'indicateur) */
 int core_view_complete(void)
 {
-	int first, last, i, a0, b0, a1, b1, tx, ty;
+	int first, last, i, a0, b0, a1, b1, tx, ty, R;
 	if (!has_doc()) return 1;
 	if (view_dirty || need_schedule) return 0;
 	visible_range(&first, &last);
+	R = render_level(T, T->level);
 	for (i = first; i <= last; i++) {
 		Page *p = &T->pages[i];
 		if (p->lstate == L_ERROR) continue;
 		if (p->lstate != L_READY) return 0;
-		if (!tile_range(p, 0, &a0, &b0, &a1, &b1)) continue;
+		if (!tiles_for(T, p, R, 0, 0, &a0, &b0, &a1, &b1)) continue;
 		for (ty = b0; ty <= b1; ty++)
 			for (tx = a0; tx <= a1; tx++) {
-				Job *j = hfind(T, i, T->level, tx, ty);
+				Job *j = hfind(T, i, R, tx, ty);
 				if (!j || (j->state != J_READY && j->state != J_FAILED)) return 0;
 			}
 	}
@@ -1459,12 +1738,36 @@ static int hbar(float *x0, float *y0, float *x1, float *y1, float *t0, float *t1
 	return 1;
 }
 
+static int fb_R;
+
 static int cmp_fallback(const void *a, const void *b)
 {
 	const Job *x = *(Job *const *)a, *y = *(Job *const *)b;
-	int dx = x->level == PREVIEW_LEVEL ? INT_MAX : abs(x->level - T->level);
-	int dy = y->level == PREVIEW_LEVEL ? INT_MAX : abs(y->level - T->level);
+	int dx = x->level == PREVIEW_LEVEL ? INT_MAX : abs(x->level - fb_R);
+	int dy = y->level == PREVIEW_LEVEL ? INT_MAX : abs(y->level - fb_R);
 	return dx > dy ? -1 : dx < dy;
+}
+
+/* dessine une tuile (de n'importe quel niveau) à sa place à l'écran */
+static void draw_tile(Tab *t, Page *p, Job *f, float X, float Y)
+{
+	float x0, y0, x1, y1;
+	if (f->level == PREVIEW_LEVEL) {
+		x0 = X; y0 = Y; x1 = X + p->pw; y1 = Y + p->ph;
+	} else if (f->level == t->level) {   /* niveau affiché : au pixel près */
+		x0 = X + (f->rect.x0 - p->pbox.x0);
+		y0 = Y + (f->rect.y0 - p->pbox.y0);
+		x1 = x0 + (f->rect.x1 - f->rect.x0);
+		y1 = y0 + (f->rect.y1 - f->rect.y0);
+	} else {                             /* autre niveau : la carte graphique met à l'échelle */
+		double r = t->scale / f->scale;
+		x0 = X + (float)(f->rect.x0 * r - p->pbox.x0);
+		y0 = Y + (float)(f->rect.y0 * r - p->pbox.y0);
+		x1 = X + (float)(f->rect.x1 * r - p->pbox.x0);
+		y1 = Y + (float)(f->rect.y1 * r - p->pbox.y0);
+	}
+	if (x1 < 0 || y1 < 0 || x0 > vw || y0 > vh) return;
+	gfx_image(f->tex, 0, 0, (float)(f->rect.x1 - f->rect.x0), (float)(f->rect.y1 - f->rect.y0), x0, y0, x1, y1, 0);
 }
 
 static void draw_pages(void)
@@ -1472,7 +1775,7 @@ static void draw_pages(void)
 	static Job **fb;
 	static int fbcap;
 	Tab *t = T;
-	int first, last, i;
+	int first, last, i, R = render_level(T, T->level);
 	double fx = floor(t->sx), fy = floor(t->sy);
 	visible_range(&first, &last);
 	for (i = first; i <= last; i++) {
@@ -1481,43 +1784,32 @@ static void draw_pages(void)
 		int a0, b0, a1, b1, tx, ty, complete = 1, drawn = 0;
 		gfx_rect(X - 1, Y - 1, X + p->pw + 1, Y + p->ph + 1, 0xff1e2023);
 		gfx_rect(X, Y, X + p->pw, Y + p->ph, 0xffffffff);
-		if (!tile_range(p, 0, &a0, &b0, &a1, &b1)) continue;
+		if (!tiles_for(t, p, R, 0, 0, &a0, &b0, &a1, &b1)) continue;
 		for (ty = b0; ty <= b1 && complete; ty++)
 			for (tx = a0; tx <= a1; tx++) {
-				Job *j = hfind(t, i, t->level, tx, ty);
+				Job *j = hfind(t, i, R, tx, ty);
 				if (!j || j->state != J_READY) { complete = 0; break; }
 			}
 		if (!complete) {
-			/* repli : aperçu et tuiles d'autres niveaux, étirés par la carte graphique */
+			/* repli : aperçu et tuiles d'autres niveaux, étirés par la carte graphique,
+			   du plus éloigné au plus proche du niveau voulu (le plus fidèle par-dessus) */
 			int n = 0, k;
 			Job *j;
 			for (j = p->ready; j; j = j->pnext) {
-				if (j->level == t->level) continue;
+				if (j->level == R) continue;
 				if (n == fbcap) { fbcap = fbcap ? fbcap * 2 : 64; fb = realloc(fb, fbcap * sizeof *fb); }
 				fb[n++] = j;
 			}
+			fb_R = R;
 			if (n > 1) qsort(fb, n, sizeof *fb, cmp_fallback);
-			for (k = 0; k < n; k++) {
-				Job *f = fb[k];
-				double r = t->scale / f->scale;
-				float x0 = X + (float)(f->rect.x0 * r - p->pbox.x0);
-				float y0 = Y + (float)(f->rect.y0 * r - p->pbox.y0);
-				float x1 = X + (float)(f->rect.x1 * r - p->pbox.x0);
-				float y1 = Y + (float)(f->rect.y1 * r - p->pbox.y0);
-				if (f->level == PREVIEW_LEVEL) { x0 = X; y0 = Y; x1 = X + p->pw; y1 = Y + p->ph; }
-				if (x1 < 0 || y1 < 0 || x0 > vw || y0 > vh) continue;
-				gfx_image(f->tex, 0, 0, (float)(f->rect.x1 - f->rect.x0), (float)(f->rect.y1 - f->rect.y0),
-						x0, y0, x1, y1, 0);
-				drawn = 1;
-			}
+			for (k = 0; k < n; k++) draw_tile(t, p, fb[k], X, Y);
+			drawn = n > 0;
 		}
 		for (ty = b0; ty <= b1; ty++)
 			for (tx = a0; tx <= a1; tx++) {
-				Job *j = hfind(t, i, t->level, tx, ty);
+				Job *j = hfind(t, i, R, tx, ty);
 				if (j && j->state == J_READY) {
-					float x0 = X + (j->rect.x0 - p->pbox.x0), y0 = Y + (j->rect.y0 - p->pbox.y0);
-					gfx_image(j->tex, 0, 0, (float)(j->rect.x1 - j->rect.x0), (float)(j->rect.y1 - j->rect.y0),
-							x0, y0, x0 + (j->rect.x1 - j->rect.x0), y0 + (j->rect.y1 - j->rect.y0), 0);
+					draw_tile(t, p, j, X, Y);
 					drawn = 1;
 				}
 			}
@@ -1739,7 +2031,7 @@ static void activate(int idx)
 	update_title();
 	view_dirty = need_schedule = dirty = 1;
 	mutex_lock(&mu);
-	cond_signal(&cv_load);
+	cond_broadcast(&cv_load);
 	mutex_unlock(&mu);
 }
 
@@ -1888,6 +2180,7 @@ void core_open(const char *path)
 	t->name = strdup(base_name(path));
 	t->scale = 1;
 	t->fit_mode = FIT_PAGE;
+	t->exact_level = INT_MIN;
 	t->label_w = -1;
 	if (ntabs == tabs_cap) {
 		tabs_cap = tabs_cap ? tabs_cap * 2 : 8;
@@ -1981,6 +2274,7 @@ static void input_commit(void)
 		else if (input_buf[0]) set_toast("Cette page n'existe pas");
 	} else if (input_mode == INPUT_PASSWORD && T) {
 		if (T->doc && fz_authenticate_password(ctx, T->doc, input_buf)) {
+			T->password = strdup(input_buf);   /* pour les instances des autres chargeurs */
 			input_mode = INPUT_NONE;
 			memset(input_buf, 0, sizeof input_buf);
 			T->need_password = 0;
@@ -2150,6 +2444,7 @@ void core_mouse_up(int btn, int x, int y, int mods)
 			double cxs = (x0 + x1) / 2, cys = (y0 + y1) / 2;
 			T->fit_mode = FIT_NONE;
 			zoom_at(T->level + (int)floor(LPO * log2(f)), cxs, cys);
+			T->exact_level = T->level;
 			T->sx += cxs - vw / 2.0;
 			T->sy += cys - vh / 2.0;
 			clamp_scroll();
@@ -2214,7 +2509,11 @@ void core_key(int key, int mods)
 		case 'G': start_goto(""); return;
 		case '0': apply_fit(FIT_PAGE, current_page(), 0); return;
 		case '1':
-			if (has_doc()) { T->fit_mode = FIT_NONE; zoom_at((int)lround(LPO * log2(dpi / 72.0)), vw / 2.0, vh / 2.0); }
+			if (has_doc()) {
+				T->fit_mode = FIT_NONE;
+				zoom_at((int)lround(LPO * log2(dpi / 72.0)), vw / 2.0, vh / 2.0);
+				T->exact_level = T->level;
+			}
 			return;
 		case '2': apply_fit(FIT_WIDTH, current_page(), 1); return;
 		case K_PLUS: if (shift) rotate(90); else zoom_step(1, vw / 2.0, vh / 2.0); return;
@@ -2351,9 +2650,9 @@ void core_stats(char *buf, int len)
 	int k, lists = 0;
 	if (!T) { snprintf(buf, len, "aucun onglet"); return; }
 	for (k = 0; k < T->npages; k++) if (T->pages[k].lstate == L_READY) lists++;
-	snprintf(buf, len, "onglet %d/%d jobs=%d tex=%.1fMo (total %.1fMo) lists=%d zoom=%.1f%% page=%d/%d rot=%d",
-			active + 1, ntabs, T->njobs, T->tex_bytes / 1048576.0, tex_total / 1048576.0, lists,
-			core_zoom_percent(), current_page() + 1, T->npages, T->rot);
+	snprintf(buf, len, "onglet %d/%d jobs=%d tex=%.1fMo (total %.1fMo, budget %.0f) lists=%d (%.1fMo) zoom=%.1f%% niveau=%d rendu=%d page=%d/%d rot=%d",
+			active + 1, ntabs, T->njobs, T->tex_bytes / 1048576.0, tex_total / 1048576.0, tex_budget / 1048576.0, lists,
+			T->list_bytes / 1048576.0, core_zoom_percent(), T->level, render_level(T, T->level), current_page() + 1, T->npages, T->rot);
 }
 
 /* ---------- initialisation ---------- */
@@ -2385,15 +2684,32 @@ int core_init(int nthreads)
 	}
 	fz_catch(ctx) return -1;
 
+	{
+		/* Budgets mémoire proportionnels à la RAM : plus il y en a, plus on garde de
+		   tuiles calculées (zoom/déplacement instantanés) et de pages analysées.
+		   8 Go -> 0,8 Go de tuiles et 1 Go de pages ; 32 Go -> 1,5 Go et 3 Go. */
+		unsigned long long ram = ram_bytes();
+		const char *e = getenv("LIRE_TEX_MB");
+		tex_budget = (size_t)fmin(fmax(ram / 10.0, 256.0 * (1 << 20)), 1536.0 * (1 << 20));
+		list_budget = (size_t)fmin(fmax(ram / 8.0, 256.0 * (1 << 20)), 3072.0 * (1 << 20));
+		if (e && atoi(e) > 0) tex_budget = (size_t)atoi(e) << 20;
+		if ((e = getenv("LIRE_LIST_MB")) && atoi(e) > 0) list_budget = (size_t)atoi(e) << 20;
+	}
 	if (nthreads <= 0) nthreads = cpu_count() - 1;
 	nworkers = clampi(nthreads, 1, MAX_WORKERS);
-	lctx = fz_clone_context(ctx);
+	nloaders = clampi(cpu_count() / 4, 1, MAX_LOADERS);
+	if (getenv("LIRE_LOADERS")) nloaders = clampi(atoi(getenv("LIRE_LOADERS")), 1, MAX_LOADERS);
+	for (i = 0; i < nloaders; i++) {
+		lctx[i] = fz_clone_context(ctx);
+		loader_page[i] = -1;
+	}
 	for (i = 0; i < nworkers; i++) {
 		wctx[i] = fz_clone_context(ctx);
 		fz_set_graphics_aa_level(wctx[i], 6);
 		fz_set_text_aa_level(wctx[i], 8);
 	}
-	thread_create(&th_loader, loader_main, NULL, 1, 16 << 20);
+	for (i = 0; i < nloaders; i++)
+		thread_create(&th_loader[i], loader_main, (void *)(intptr_t)i, 1, 16 << 20);
 	for (i = 0; i < nworkers; i++)
 		thread_create(&th_workers[i], worker_main, (void *)(intptr_t)i, 1, 4 << 20);
 	update_title();
@@ -2422,10 +2738,10 @@ void core_shutdown(void)
 	cond_broadcast(&cv_work);
 	cond_broadcast(&cv_load);
 	mutex_unlock(&mu);
-	thread_join(th_loader);
+	for (i = 0; i < nloaders; i++) thread_join(th_loader[i]);
 	for (i = 0; i < nworkers; i++) thread_join(th_workers[i]);
 	for (i = 0; i < nworkers; i++) fz_drop_context(wctx[i]);
-	fz_drop_context(lctx);
+	for (i = 0; i < nloaders; i++) fz_drop_context(lctx[i]);
 	for (i = 0; i < NTEXT; i++)
 		if (texts[i].tex) gfx_tex_free(texts[i].tex);
 	if (icon_rot[0]) gfx_tex_free(icon_rot[0]);

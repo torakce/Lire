@@ -19,6 +19,12 @@ if [ ! -d "$MUPDF" ]; then
 		thirdparty/lcms2 thirdparty/openjpeg thirdparty/zlib
 fi
 
+# Correctifs de performance de Lire sur MuPDF (voir patches/LISEZMOI.md) : appliqués une seule fois
+PATCH="$HERE/patches/mupdf-$MUPDF_VERSION-lire.patch"
+if ! git -C "$MUPDF" apply --reverse --check "$PATCH" 2>/dev/null; then
+	git -C "$MUPDF" apply "$PATCH"
+fi
+
 # Uniquement le PDF (et les images) : pas d'EPUB/HTML/XPS/SVG, pas de JavaScript,
 # pas de polices de secours Noto (gain de taille) ; les polices standard PDF restent incluses.
 MUOPTS="build=release HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no HAVE_LIBCRYPTO=no \

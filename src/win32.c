@@ -555,8 +555,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 		TranslateMessage(&m);
 		DispatchMessageW(&m);
 	}
-	/* fermeture instantanée : on arrête les rendus, Windows libère la mémoire */
+	/* Fermeture instantanée : on arrête les rendus et on laisse Windows récupérer la
+	   mémoire d'un bloc. TerminateProcess évite au pilote graphique de libérer une à
+	   une des centaines de Mo de textures (plusieurs secondes sur certaines machines).
+	   Les réglages sont déjà enregistrés (WM_CLOSE). */
 	core_quick_exit();
+	TerminateProcess(GetCurrentProcess(), 0);
 	ExitProcess(0);
 	return 0;
 }

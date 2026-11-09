@@ -171,6 +171,65 @@ int main(int argc, char **argv)
 		printf("stress OK, textures restantes : %ld octets\n", soft_tex_bytes);
 		return 0;
 	}
+	if (argc > 4 && !strcmp(argv[4], "quitter")) {
+		/* durée de l'arrêt (core_quick_exit) en plein travail de fond */
+		int k;
+		for (k = 0; k < 5; k++) {
+			double tq;
+			core_open(file);
+			for (i = 0; i < 3 + k; i++) { core_poll(); core_draw(); wait_wake(0.05); }
+			for (i = 0; i < 4; i++) core_wheel(1, 0, W / 2, H / 2, LMOD_CTRL);
+			t0 = platform_time();
+			while (platform_time() - t0 < 0.2 + 0.1 * k) { core_poll(); core_draw(); wait_wake(0.02); }
+			tq = platform_time();
+			core_quick_exit();
+			printf("arrêt en plein travail : %.1f ms\n", (platform_time() - tq) * 1000);
+			core_key('W', LMOD_CTRL);
+		}
+		return 0;
+	}
+	if (argc > 4 && !strcmp(argv[4], "interactif")) {
+		/* Ce que l'utilisateur ressent : après chaque action (en laissant le temps
+		   d'anticiper entre deux actions, comme un humain), délai avant que la vue
+		   soit entièrement nette. harness f sortie threads interactif [page] */
+		int pg = argc > 5 ? atoi(argv[5]) : 1;
+		double tot = 0;
+		t0 = platform_time();
+		core_open(file);
+		if (pg > 1) { char b[16]; snprintf(b, sizeof b, "%d", pg); for (i = 0; b[i]; i++) core_char(b[i]); core_key(K_ENTER, 0); }
+		tot += pump("ouverture -> page nette", 120);
+		save("i01_ouverture.png");
+		pump("  (anticipation)", 300);
+		core_wheel(1, 0, W * 2 / 3, H / 3, LMOD_CTRL);
+		tot += pump("molette +1 cran", 120);
+		pump("  (anticipation)", 300);
+		core_wheel(1, 0, W * 2 / 3, H / 3, LMOD_CTRL);
+		tot += pump("molette +1 cran", 120);
+		pump("  (anticipation)", 300);
+		core_wheel(1, 0, W / 3, H / 2, LMOD_CTRL);
+		tot += pump("molette +1 cran (autre endroit)", 120);
+		save("i02_zoom.png");
+		pump("  (anticipation)", 300);
+		core_wheel(-1, 0, W / 2, H / 2, LMOD_CTRL);
+		tot += pump("molette -1 cran", 120);
+		pump("  (anticipation)", 300);
+		core_mouse_down(BTN_LEFT, 1200, 700, 0);
+		for (i = 1; i <= 20; i++) core_mouse_move(1200 - i * 40, 700 - i * 20, 0);
+		core_mouse_up(BTN_LEFT, 400, 300, 0);
+		tot += pump("glisser 800 x 400 px", 120);
+		pump("  (anticipation)", 300);
+		core_key(K_PGDN, 0);
+		tot += pump("page suivante", 120);
+		pump("  (anticipation)", 300);
+		for (i = 0; i < 3; i++) core_wheel(1, 0, W / 2, H / 2, LMOD_CTRL);
+		tot += pump("molette +3 crans d'un coup", 120);
+		pump("  (anticipation)", 300);
+		core_char('f');
+		tot += pump("retour page entière", 120);
+		printf("TOTAL des attentes ressenties : %.0f ms\n", tot);
+		core_shutdown();
+		return 0;
+	}
 	if (argc > 4 && !strcmp(argv[4], "tabs")) {
 		/* scénario onglets : harness f1 sortie threads tabs f2 f3 ... */
 		char st[256];

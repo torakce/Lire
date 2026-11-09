@@ -47,6 +47,12 @@ static inline int cpu_count(void)
 	DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
 	return n > 0 ? (int)n : 1;
 }
+static inline unsigned long long ram_bytes(void)
+{
+	MEMORYSTATUSEX m;
+	m.dwLength = sizeof m;
+	return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys : (4ULL << 30);
+}
 
 #else /* POSIX */
 #include <pthread.h>
@@ -92,6 +98,11 @@ static inline int cpu_count(void)
 {
 	long n = sysconf(_SC_NPROCESSORS_ONLN);
 	return n > 0 ? (int)n : 1;
+}
+static inline unsigned long long ram_bytes(void)
+{
+	long p = sysconf(_SC_PHYS_PAGES), s = sysconf(_SC_PAGE_SIZE);
+	return p > 0 && s > 0 ? (unsigned long long)p * s : (4ULL << 30);
 }
 #endif
 
