@@ -53,7 +53,7 @@ enum { L_NONE, L_QUEUED, L_BUILDING, L_READY, L_ERROR };
 enum { J_IDLE, J_QUEUED, J_RUNNING, J_DONE, J_READY, J_FAILED };
 enum { FIT_NONE, FIT_PAGE, FIT_WIDTH };
 enum { DRAG_NONE, DRAG_PAN, DRAG_ZOOM, DRAG_VBAR, DRAG_HBAR, DRAG_AUTO, DRAG_SELECT };
-enum { HIT_NONE = 0, HIT_PLUS, HIT_OPENWITH, HIT_ROT_CCW, HIT_ROT_CW, HIT_TAB = 100000, HIT_CLOSE = 200000 };
+enum { HIT_NONE = 0, HIT_PLUS, HIT_OPENWITH, HIT_VIEW, HIT_ROT_CCW, HIT_ROT_CW, HIT_TAB = 100000, HIT_CLOSE = 200000 };
 
 typedef struct Job Job;
 typedef struct Tab Tab;
@@ -92,8 +92,11 @@ typedef struct {
 	size_t lbytes;          /* mémoire de la display list */
 	fz_stext_page *stext;   /* texte de la page (sélection), extrait à la demande depuis la display list */
 	int sstate;
+	int row;                /* rangée (une page, ou deux côte à côte) */
 	Job *ready;
 } Page;
+
+typedef struct { int first, n; double top, h; } Row;
 
 struct Tab {
 	fz_document *doc;                  /* utilisé par le thread principal et le chargeur 0 */
@@ -116,6 +119,10 @@ struct Tab {
 	double sx, sy, cw, ch;
 	int maxpw;
 	int fit_mode;
+	/* mode d'affichage : une ou deux pages par rangée, page de garde seule, continu ou rangée par rangée */
+	int two_up, cover, continuous;
+	Row *rows;
+	int nrows, cur_row;
 	int *lq, *lq_old, nlq, nlq_old, lq_pos;
 	unsigned last_gen;
 	int needs_relayout;
@@ -165,6 +172,7 @@ static float dpi = 96, ui = 1;
 static int gap = 10, sbw = 12;
 static int view_dirty, need_schedule, dirty = 1;
 static int wheel_zoom;
+static int view_default = VIEW_CONTINUOUS;   /* mode d'affichage des prochains fichiers ouverts */
 static size_t tex_total;
 
 /* interaction */
@@ -792,6 +800,9 @@ static void tab_clear(Tab *t)
 	free(t->pages);
 	t->pages = NULL;
 	t->npages = 0;
+	free(t->rows);
+	t->rows = NULL;
+	t->nrows = 0;
 	t->list_bytes = 0;
 	free(t->lq); free(t->lq_old);
 	t->lq = t->lq_old = NULL;
@@ -821,13 +832,37 @@ static void tab_free(Tab *t)
 
 /* ---------- mise en page et vue (onglet actif) ---------- */
 
+/* deux pages côte à côte ? (sans objet pour un document d'une seule page) */
+static int spread(Tab *t) { return t->two_up && t->npages > 1; }
+
+/* Répartit les pages en rangées : une par rangée, ou deux (la page de garde restant seule). */
+static void build_rows(Tab *t)
+{
+	int i = 0, r = 0, k;
+	while (i < t->npages) {
+		int n = (spread(t) && !(t->cover && i == 0) && i + 1 < t->npages) ? 2 : 1;
+		t->rows[r].first = i;
+		t->rows[r].n = n;
+		for (k = 0; k < n; k++) t->pages[i + k].row = r;
+		i += n;
+		r++;
+	}
+	t->nrows = r;
+	t->cur_row = clampi(t->cur_row, 0, r > 0 ? r - 1 : 0);
+}
+
+/* rangées présentes dans le contenu : toutes en continu, sinon seulement la rangée courante */
+static void shown_rows(Tab *t, int *r0, int *r1)
+{
+	if (t->continuous) { *r0 = 0; *r1 = t->nrows - 1; }
+	else *r0 = *r1 = t->cur_row;
+}
+
 static void layout(void)
 {
 	Tab *t = T;
 	fz_matrix m = view_ctm(t->rot, t->scale);
-	double y = gap;
-	int i;
-	t->maxpw = 0;
+	int i, r, r0, r1, half = 0, y = gap, two = spread(t);
 	for (i = 0; i < t->npages; i++) {
 		Page *p = &t->pages[i];
 		p->pbox = fz_round_rect(fz_transform_rect(p->bounds, m));
@@ -835,13 +870,33 @@ static void layout(void)
 		p->ph = p->pbox.y1 - p->pbox.y0;
 		if (p->pw < 1) p->pw = 1;
 		if (p->ph < 1) p->ph = 1;
-		if (p->pw > t->maxpw) t->maxpw = p->pw;
-		p->top = y;
-		y += p->ph + gap;
 	}
-	for (i = 0; i < t->npages; i++)
-		t->pages[i].left = gap + (t->maxpw - t->pages[i].pw) / 2;
-	t->cw = t->maxpw + 2.0 * gap;
+	shown_rows(t, &r0, &r1);
+	for (r = r0; r <= r1; r++)
+		for (i = t->rows[r].first; i < t->rows[r].first + t->rows[r].n; i++)
+			if (t->pages[i].pw > half) half = t->pages[i].pw;
+	t->maxpw = half;
+	for (r = r0; r <= r1; r++) {
+		Row *row = &t->rows[r];
+		int h = 0, k;
+		for (k = 0; k < row->n; k++)
+			if (t->pages[row->first + k].ph > h) h = t->pages[row->first + k].ph;
+		row->top = y;
+		row->h = h;
+		for (k = 0; k < row->n; k++) {
+			Page *p = &t->pages[row->first + k];
+			p->top = y + (h - p->ph) / 2;
+			if (!two) p->left = gap + (half - p->pw) / 2;
+			else {
+				/* les pages s'appuient sur la reliure, au milieu ; une page seule va à gauche,
+				   sauf la page de garde, à droite comme la couverture d'un livre */
+				int right = row->n == 2 ? k == 1 : (t->cover && row->first == 0);
+				p->left = right ? gap + half + gap : gap + half - p->pw;
+			}
+		}
+		y += h + gap;
+	}
+	t->cw = (two ? 2.0 * half + gap : half) + 2.0 * gap;
 	t->ch = y;
 }
 
@@ -871,30 +926,57 @@ static void set_level(int L)
 	view_dirty = dirty = 1;
 }
 
-static int page_at_y(double y)
+/* rangée affichée à la hauteur y du contenu */
+static int row_at_y(double y)
 {
-	int lo = 0, hi = T->npages - 1;
+	int lo, hi;
+	if (!T->continuous) return T->cur_row;
+	lo = 0; hi = T->nrows - 1;
 	while (lo < hi) {
 		int mid = (lo + hi + 1) / 2;
-		if (T->pages[mid].top - gap / 2.0 <= y) lo = mid; else hi = mid - 1;
+		if (T->rows[mid].top - gap / 2.0 <= y) lo = mid; else hi = mid - 1;
 	}
 	return lo;
 }
 
-static void visible_range(int *first, int *last)
+/* page au point (x, y) du contenu (dans une rangée de deux pages : la plus proche) */
+static int page_at(double x, double y)
 {
-	Page *pg = T->pages;
-	int i = page_at_y(T->sy), k;
-	if (pg[i].top + pg[i].ph <= T->sy && i < T->npages - 1) i++;
-	k = i;
-	while (k + 1 < T->npages && pg[k + 1].top < T->sy + vh) k++;
-	*first = i;
-	*last = k;
+	Row *row = &T->rows[row_at_y(y)];
+	if (row->n == 2 && x >= T->pages[row->first + 1].left - gap / 2.0) return row->first + 1;
+	return row->first;
 }
 
+static void visible_range(int *first, int *last)
+{
+	Row *rw = T->rows;
+	int i = row_at_y(T->sy), k;
+	if (T->continuous) {
+		if (rw[i].top + rw[i].h <= T->sy && i < T->nrows - 1) i++;
+		k = i;
+		while (k + 1 < T->nrows && rw[k + 1].top < T->sy + vh) k++;
+	} else k = i;
+	*first = rw[i].first;
+	*last = rw[k].first + rw[k].n - 1;
+}
+
+/* Page courante : la première de la rangée au centre de l'écran ; si l'on est assez
+   zoomé pour ne plus voir la double page entière, celle qui est sous le centre. */
 static int current_page(void)
 {
-	return has_doc() ? page_at_y(T->sy + vh / 2.0) : 0;
+	if (!has_doc()) return 0;
+	if (T->cw > vw) return page_at(T->sx + vw / 2.0, T->sy + vh / 2.0);
+	return T->rows[row_at_y(T->sy + vh / 2.0)].first;
+}
+
+/* en mode rangée par rangée : affiche la rangée de la page i */
+static void show_row_of(int i)
+{
+	Tab *t = T;
+	if (!t->continuous && t->cur_row != t->pages[i].row) {
+		t->cur_row = t->pages[i].row;
+		layout();
+	}
 }
 
 /* Zoom au niveau L en gardant fixe le point du document situé sous (x, y). */
@@ -905,7 +987,7 @@ static void zoom_at(int L, double x, double y)
 	Page *p;
 	double ux, uy;
 	if (!has_doc()) return;
-	i = page_at_y(t->sy + y);
+	i = page_at(t->sx + x, t->sy + y);
 	p = &t->pages[i];
 	ux = (x + t->sx - p->left + p->pbox.x0) / t->scale;
 	uy = (y + t->sy - p->top + p->pbox.y0) / t->scale;
@@ -919,8 +1001,11 @@ static void center_on_page(int i)
 {
 	Tab *t = T;
 	Page *p = &t->pages[i];
-	if (p->ph + 2 * gap <= vh) t->sy = p->top + p->ph / 2.0 - vh / 2.0;
-	else t->sy = p->top - gap;
+	Row *row;
+	show_row_of(i);
+	row = &t->rows[p->row];
+	if (row->h + 2 * gap <= vh) t->sy = row->top + row->h / 2.0 - vh / 2.0;
+	else t->sy = row->top - gap;
 	if (p->pw + 2 * gap <= vw) t->sx = p->left + p->pw / 2.0 - vw / 2.0;
 	clamp_scroll();
 	view_dirty = dirty = 1;
@@ -931,30 +1016,40 @@ static void apply_fit(int mode, int i, int keep_position)
 	Tab *t = T;
 	Page *p;
 	fz_rect r;
-	double w, h, s;
+	double w, h, s, margin = 2.0 * gap;
 	if (!has_doc()) return;
 	t->fit_mode = mode;
 	if (mode == FIT_NONE) return;
 	i = clampi(i, 0, t->npages - 1);
 	p = &t->pages[i];
-	r = rotated_bounds(p, t->rot);
-	w = fmax(r.x1 - r.x0, 1);
-	h = fmax(r.y1 - r.y0, 1);
+	if (!t->continuous) t->cur_row = p->row;   /* la mise en page suit (set_level) */
+	{
+		/* on ajuste la rangée : la page, ou la double page (même zoom pour une page de garde seule) */
+		Row *row = &t->rows[p->row];
+		int k;
+		w = h = 1;
+		for (k = 0; k < row->n; k++) {
+			r = rotated_bounds(&t->pages[row->first + k], t->rot);
+			w = fmax(w, r.x1 - r.x0);
+			h = fmax(h, r.y1 - r.y0);
+		}
+		if (spread(t)) { w *= 2; margin = 3.0 * gap; }
+	}
 	if (mode == FIT_PAGE) {
-		s = fmin((vw - 2.0 * gap) / w, (vh - 2.0 * gap) / h);
+		s = fmin((vw - margin) / w, (vh - 2.0 * gap) / h);
 		set_level((int)floor(LPO * log2(fmax(s, 1e-6))));
 		t->exact_level = t->level;
 		center_on_page(i);
 	} else {
-		s = (vw - 2.0 * gap - sbw) / w;
+		s = (vw - margin - sbw) / w;
 		if (keep_position) {
 			zoom_at((int)floor(LPO * log2(fmax(s, 1e-6))), vw / 2.0, vh / 2.0);
 		} else {
 			set_level((int)floor(LPO * log2(fmax(s, 1e-6))));
-			t->sy = p->top - gap;
+			t->sy = t->rows[p->row].top - gap;
 		}
 		t->exact_level = t->level;
-		t->sx = p->left + p->pw / 2.0 - vw / 2.0;
+		t->sx = spread(t) ? t->cw / 2.0 - vw / 2.0 : p->left + p->pw / 2.0 - vw / 2.0;
 		clamp_scroll();
 	}
 	view_dirty = dirty = 1;
@@ -966,6 +1061,30 @@ static void goto_page(int i)
 	i = clampi(i, 0, T->npages - 1);
 	if (T->fit_mode != FIT_NONE) apply_fit(T->fit_mode, i, 0);
 	else center_on_page(i);
+}
+
+/* rangée précédente / suivante (une page, ou une double page) */
+static void goto_row(int r)
+{
+	if (has_doc()) goto_page(T->rows[clampi(r, 0, T->nrows - 1)].first);
+}
+
+/* Défilement vertical. En mode « page par page », arrivé au bout de la rangée, on
+   passe à la suivante (en haut) ou à la précédente (en bas), comme dans Acrobat. */
+static void scroll_y(double dy)
+{
+	Tab *t = T;
+	double before = t->sy;
+	int r;
+	t->sy += dy;
+	clamp_scroll();
+	view_dirty = 1;
+	if (t->continuous || dy == 0 || fabs(t->sy - before) > 0.5) return;
+	r = t->cur_row + (dy > 0 ? 1 : -1);
+	if (r < 0 || r >= t->nrows) return;
+	goto_row(r);
+	t->sy = dy > 0 ? -1e12 : 1e12;
+	clamp_scroll();
 }
 
 /* Zoom par crans (molette, +/-) : on se cale sur la grille des niveaux de rendu,
@@ -1039,9 +1158,10 @@ static int view_to_page(double x, double y, int *page, fz_point *pt, int clamp)
 	double X, Y, u, v;
 	int i;
 	if (!has_doc()) return 0;
-	i = clamp && sel_on ? sel_page : page_at_y(t->sy + y);
+	i = clamp && sel_on ? sel_page : page_at(t->sx + x, t->sy + y);
 	if (i < 0 || i >= t->npages) return 0;
 	p = &t->pages[i];
+	if (!t->continuous && p->row != t->cur_row) return 0;
 	X = p->left - floor(t->sx);
 	Y = p->top - floor(t->sy);
 	u = x - X;
@@ -1400,8 +1520,15 @@ static void schedule(void)
 		if (cur - d >= first) order[n++] = cur - d;
 	}
 	nvis = n;
-	if (last + 1 < t->npages) order[n++] = last + 1;
-	if (first - 1 >= 0) order[n++] = first - 1;
+	/* voisines : les pages de la rangée suivante et de la précédente */
+	if (last + 1 < t->npages) {
+		Row *nr = &t->rows[t->pages[last + 1].row];
+		for (k = 0; k < nr->n; k++) order[n++] = nr->first + k;
+	}
+	if (first - 1 >= 0) {
+		Row *pr = &t->rows[t->pages[first - 1].row];
+		for (k = pr->n - 1; k >= 0; k--) order[n++] = pr->first + k;
+	}
 
 	/* passe 1 : analyse des pages, tuiles visibles et couronne, pages voisines */
 	for (k = 0; k < n; k++) {
@@ -1898,6 +2025,43 @@ static void *make_open_icon(int size)
 	return tex;
 }
 
+/* icône « affichage » : deux pages côte à côte */
+static void *icon_view;
+
+static void *make_view_icon(int size)
+{
+	fz_pixmap *pix = NULL;
+	fz_device *dev = NULL;
+	fz_path *path = NULL;
+	fz_stroke_state *ss = NULL;
+	void *tex = NULL;
+	fz_var(pix); fz_var(dev); fz_var(path); fz_var(ss);
+	fz_try(ctx) {
+		float s = (float)size, white[3] = { 1, 1, 1 };
+		pix = fz_new_pixmap(ctx, fz_device_bgr(ctx), size, size, NULL, 1);
+		fz_clear_pixmap(ctx, pix);
+		path = fz_new_path(ctx);
+		fz_rectto(ctx, path, s * 0.12f, s * 0.20f, s * 0.45f, s * 0.80f);
+		fz_rectto(ctx, path, s * 0.55f, s * 0.20f, s * 0.88f, s * 0.80f);
+		ss = fz_new_stroke_state(ctx);
+		ss->linewidth = s * 0.09f;
+		ss->linejoin = FZ_LINEJOIN_ROUND;
+		dev = fz_new_draw_device(ctx, fz_identity, pix);
+		fz_stroke_path(ctx, dev, path, ss, fz_identity, fz_device_bgr(ctx), white, 1, fz_default_color_params);
+		fz_close_device(ctx, dev);
+		tex = gfx_tex_create(size, size, fz_pixmap_samples(ctx, pix), (int)fz_pixmap_stride(ctx, pix));
+	}
+	fz_always(ctx) {
+		fz_drop_device(ctx, dev);
+		fz_drop_path(ctx, path);
+		fz_drop_stroke_state(ctx, ss);
+		fz_drop_pixmap(ctx, pix);
+	}
+	fz_catch(ctx)
+		tex = NULL;
+	return tex;
+}
+
 static void ensure_icons(void)
 {
 	int s = (int)lround(20 * ui);
@@ -1905,6 +2069,8 @@ static void ensure_icons(void)
 	if (icon_rot[0]) gfx_tex_free(icon_rot[0]);
 	if (icon_rot[1]) gfx_tex_free(icon_rot[1]);
 	if (icon_open) gfx_tex_free(icon_open);
+	if (icon_view) gfx_tex_free(icon_view);
+	icon_view = make_view_icon((int)lround(18 * ui));
 	icon_rot[0] = make_rot_icon(s, 0);
 	icon_rot[1] = make_rot_icon(s, 1);
 	icon_open = make_open_icon((int)lround(18 * ui));
@@ -1913,7 +2079,7 @@ static void ensure_icons(void)
 
 /* ---------- barre d'onglets ---------- */
 
-typedef struct { float x0, tab_w, avail_x1, plus_x0, plus_x1, ow_x0, ccw_x0, cw_x0, btn_w, top; } BarLayout;
+typedef struct { float x0, tab_w, avail_x1, plus_x0, plus_x1, ow_x0, vm_x0, ccw_x0, cw_x0, btn_w, top; } BarLayout;
 
 static void bar_layout(BarLayout *L)
 {
@@ -1922,7 +2088,8 @@ static void bar_layout(BarLayout *L)
 	L->btn_w = (float)bar_h;
 	L->cw_x0 = win_w - pad - L->btn_w;
 	L->ccw_x0 = L->cw_x0 - L->btn_w;
-	L->ow_x0 = L->ccw_x0 - L->btn_w - 6 * ui;
+	L->vm_x0 = L->ccw_x0 - L->btn_w;
+	L->ow_x0 = L->vm_x0 - L->btn_w - 6 * ui;
 	L->x0 = pad;
 	L->avail_x1 = L->ow_x0 - pad - plus_w;
 	avail = fmaxf(L->avail_x1 - L->x0, 1);
@@ -1958,6 +2125,7 @@ static int bar_hit(int x, int y)
 	bar_layout(&L);
 	if (x >= L.cw_x0 && x < L.cw_x0 + L.btn_w) return HIT_ROT_CW;
 	if (x >= L.ccw_x0 && x < L.ccw_x0 + L.btn_w) return HIT_ROT_CCW;
+	if (x >= L.vm_x0 && x < L.vm_x0 + L.btn_w) return HIT_VIEW;
 	if (x >= L.ow_x0 && x < L.ow_x0 + L.btn_w) return HIT_OPENWITH;
 	if (x >= L.plus_x0 && x < L.plus_x1) return HIT_PLUS;
 	if (x >= L.avail_x1 || y < L.top) return HIT_NONE;
@@ -2051,6 +2219,17 @@ static void draw_tabbar(void)
 			gfx_image(icon_open, 0, 0, (float)iw, (float)iw, ix, iy, ix + iw, iy + iw, col);
 		}
 	}
+	/* bouton « affichage » (une / deux pages, continu / page par page) */
+	{
+		float b0 = 4 * ui, b1 = bar_h - 4 * ui;
+		unsigned col = hover == HIT_VIEW ? 0xffffffff : 0xffc8ccd2;
+		if (hover == HIT_VIEW) gfx_rect(L.vm_x0 + 2 * ui, b0, L.vm_x0 + L.btn_w - 2 * ui, b1, 0xff3a3d42);
+		if (icon_view) {
+			int iw = (int)lround(18 * ui);
+			float ix = floorf(L.vm_x0 + (L.btn_w - iw) / 2), iy = floorf((bar_h - iw) / 2.0f);
+			gfx_image(icon_view, 0, 0, (float)iw, (float)iw, ix, iy, ix + iw, iy + iw, col);
+		}
+	}
 	/* boutons de rotation */
 	for (i = 0; i < 2; i++) {
 		float bx = i == 0 ? L.ccw_x0 : L.cw_x0, b0 = 4 * ui, b1 = bar_h - 4 * ui;
@@ -2077,6 +2256,7 @@ static void draw_tooltip(void)
 	switch (hover) {
 	case HIT_PLUS: s = "Ouvrir un fichier  (Ctrl+O)"; x = L.plus_x0; break;
 	case HIT_OPENWITH: s = "Ouvrir avec un autre logiciel  (Ctrl+Maj+O)"; x = L.ow_x0; break;
+	case HIT_VIEW: s = "Affichage : une ou deux pages, continu ou page par page  (D, Maj+D, C)"; x = L.vm_x0; break;
 	case HIT_ROT_CCW: s = "Rotation antihoraire  (Maj+R)"; x = L.ccw_x0; break;
 	case HIT_ROT_CW: s = "Rotation horaire  (R)"; x = L.cw_x0; break;
 	default:
@@ -2246,6 +2426,8 @@ static const char *help_lines[][2] = {
 	{ "Page pr\xc3\xa9""c\xc3\xa9""dente / suivante", "Pg.Pr\xc3\xa9""c / Pg.Suiv" },
 	{ "Premi\xc3\xa8re / derni\xc3\xa8re page", "D\xc3\xa9""but / Fin" },
 	{ "Aller \xc3\xa0 la page", "Ctrl+G  ou taper le num\xc3\xa9ro" },
+	{ "Deux pages / page de garde s\xc3\xa9par\xc3\xa9""e", "D  /  Maj+D  (ou bouton en haut \xc3\xa0 droite)" },
+	{ "Continu ou page par page", "C" },
 	{ "Rotation horaire", "R,  Ctrl+Maj++  ou bouton en haut \xc3\xa0 droite" },
 	{ "Rotation antihoraire", "Maj+R,  Ctrl+Maj+-  ou bouton" },
 	{ "Molette = zoom ou d\xc3\xa9""filement", "M" },
@@ -2338,12 +2520,19 @@ static void draw_overlays(void)
 		int w, pad = (int)(8 * ui), right = vw - (T->ch > vh ? sbw : 0) - (int)(10 * ui);
 		int bottom = vh - (T->cw > vw ? sbw : 0) - (int)(10 * ui);
 		TextTex *st;
-		if (T->rot)
-			snprintf(buf, sizeof buf, "%d / %d    %.0f %%    %d\xc2\xb0%s", current_page() + 1, T->npages, core_zoom_percent(),
-					T->rot, core_view_complete() ? "" : "   \xe2\x80\xa6");
-		else
-			snprintf(buf, sizeof buf, "%d / %d    %.0f %%%s", current_page() + 1, T->npages, core_zoom_percent(),
-					core_view_complete() ? "" : "   \xe2\x80\xa6");
+		{
+			char pg[48];
+			int cp = current_page();
+			Row *row = &T->rows[T->pages[cp].row];
+			if (row->n == 2 && T->cw <= vw) snprintf(pg, sizeof pg, "%d\xe2\x80\x93%d", row->first + 1, row->first + 2);
+			else snprintf(pg, sizeof pg, "%d", cp + 1);
+			if (T->rot)
+				snprintf(buf, sizeof buf, "%s / %d    %.0f %%    %d\xc2\xb0%s", pg, T->npages, core_zoom_percent(),
+						T->rot, core_view_complete() ? "" : "   \xe2\x80\xa6");
+			else
+				snprintf(buf, sizeof buf, "%s / %d    %.0f %%%s", pg, T->npages, core_zoom_percent(),
+						core_view_complete() ? "" : "   \xe2\x80\xa6");
+		}
 		st = text_get(buf, px, 0);
 		w = st->w;
 		gfx_rect((float)(right - w - 2 * pad), (float)(bottom - st->h - pad), (float)right, (float)bottom, 0xc0202226);
@@ -2537,6 +2726,8 @@ static int finish_open(void)
 		return -1;
 	}
 	t->pages = calloc(t->npages, sizeof *t->pages);
+	t->rows = calloc(t->npages, sizeof *t->rows);
+	t->cur_row = 0;
 	t->lq = calloc(t->npages + 8, sizeof *t->lq);
 	t->lq_old = calloc(t->npages + 8, sizeof *t->lq_old);
 	pdf = pdf_specifics(ctx, t->doc);
@@ -2572,6 +2763,7 @@ static int finish_open(void)
 		fz_try(ctx) pdf_drop_page_tree(ctx, pdf);
 		fz_catch(ctx) {}
 	}
+	build_rows(t);
 	compute_level_limits();
 	{
 		fz_rect r = rotated_bounds(&t->pages[0], t->rot);
@@ -2625,6 +2817,9 @@ void core_open(const char *path)
 	t->scale = 1;
 	t->fit_mode = FIT_PAGE;
 	t->exact_level = INT_MIN;
+	t->two_up = (view_default & VIEW_TWO_UP) != 0;
+	t->cover = (view_default & VIEW_COVER) != 0;
+	t->continuous = (view_default & VIEW_CONTINUOUS) != 0;
 	t->label_w = -1;
 	if (ntabs == tabs_cap) {
 		tabs_cap = tabs_cap ? tabs_cap * 2 : 8;
@@ -2685,6 +2880,7 @@ void core_reload(void)
 			apply_fit(old_fit, cur, 0);
 		} else {
 			t->fit_mode = FIT_NONE;
+			if (!t->continuous) t->cur_row = t->pages[clampi(cur, 0, t->npages - 1)].row;
 			set_level(old_level);
 			t->sx = ox; t->sy = oy;
 			clamp_scroll();
@@ -2778,6 +2974,71 @@ static void open_with(void)
 	dirty = 1;
 }
 
+/* ---------- mode d'affichage ---------- */
+
+static int tab_view_mode(Tab *t)
+{
+	return (t->two_up ? VIEW_TWO_UP : 0) | (t->cover ? VIEW_COVER : 0) | (t->continuous ? VIEW_CONTINUOUS : 0);
+}
+
+int core_view_mode(void) { return view_default; }
+void core_set_view_mode(int flags) { view_default = flags & (VIEW_TWO_UP | VIEW_COVER | VIEW_CONTINUOUS); }
+
+/* Change le mode de l'onglet affiché (il devient aussi le mode des prochains fichiers ouverts). */
+static void set_view_mode(int flags)
+{
+	Tab *t = T;
+	char msg[160];
+	core_set_view_mode(flags);
+	snprintf(msg, sizeof msg, "Affichage : %s%s, %s", (flags & VIEW_TWO_UP) ? "deux pages" : "une page",
+			(flags & VIEW_TWO_UP) && (flags & VIEW_COVER) ? ", page de garde s\xc3\xa9par\xc3\xa9""e" : "",
+			(flags & VIEW_CONTINUOUS) ? "d\xc3\xa9""filement continu" : "page par page");
+	if (has_doc() && tab_view_mode(t) != view_default) {
+		int cur = current_page();
+		t->two_up = (flags & VIEW_TWO_UP) != 0;
+		t->cover = (flags & VIEW_COVER) != 0;
+		t->continuous = (flags & VIEW_CONTINUOUS) != 0;
+		build_rows(t);
+		t->cur_row = t->pages[cur].row;
+		layout();
+		if (t->fit_mode != FIT_NONE) apply_fit(t->fit_mode, cur, 0);
+		else center_on_page(cur);
+		view_dirty = 1;
+	}
+	set_toast(msg);
+	dirty = 1;
+}
+
+/* menu du bouton « Affichage » de la barre */
+static void view_menu(void)
+{
+	static const char *labels[] = {
+		"Une page", "Deux pages c\xc3\xb4te \xc3\xa0 c\xc3\xb4te\tD",
+		"Page de garde s\xc3\xa9par\xc3\xa9""e (en deux pages)\tMaj+D", NULL,
+		"D\xc3\xa9""filement continu\tC", "Page par page\tC",
+	};
+	int flags[6], m = has_doc() ? tab_view_mode(T) : view_default, r;
+	BarLayout L;
+	bar_layout(&L);
+	flags[0] = (m & VIEW_TWO_UP) ? 0 : MENU_CHECKED;
+	flags[1] = (m & VIEW_TWO_UP) ? MENU_CHECKED : 0;
+	flags[2] = ((m & VIEW_COVER) ? MENU_TICKED : 0) | ((m & VIEW_TWO_UP) ? 0 : MENU_DISABLED);
+	flags[3] = MENU_SEPARATOR;
+	flags[4] = (m & VIEW_CONTINUOUS) ? MENU_CHECKED : 0;
+	flags[5] = (m & VIEW_CONTINUOUS) ? 0 : MENU_CHECKED;
+	hover = HIT_NONE;
+	drag = DRAG_NONE;
+	r = platform_popup_menu(labels, flags, 6, (int)(L.vm_x0 + L.btn_w), bar_h);
+	switch (r) {
+	case 0: set_view_mode(m & ~VIEW_TWO_UP); break;
+	case 1: set_view_mode(m | VIEW_TWO_UP); break;
+	case 2: set_view_mode(m ^ VIEW_COVER); break;
+	case 4: set_view_mode(m | VIEW_CONTINUOUS); break;
+	case 5: set_view_mode(m & ~VIEW_CONTINUOUS); break;
+	}
+	dirty = 1;
+}
+
 void core_set_wheel_zoom(int on) { wheel_zoom = on; }
 int core_wheel_zoom(void) { return wheel_zoom; }
 
@@ -2818,6 +3079,7 @@ void core_mouse_down(int btn, int x, int y, int mods)
 			else if (h >= HIT_TAB) activate(h - HIT_TAB);
 			else if (h == HIT_PLUS) platform_open_dialog();
 			else if (h == HIT_OPENWITH) open_with();
+			else if (h == HIT_VIEW) view_menu();
 			else if (h == HIT_ROT_CCW) rotate(-90);
 			else if (h == HIT_ROT_CW) rotate(90);
 		}
@@ -2981,15 +3243,14 @@ void core_wheel(float dy, float dx, int x, int y, int mods)
 		return;
 	}
 	if (mods & LMOD_SHIFT) { dx = -dy; dy = 0; }
-	T->sy -= dy * 110 * ui;
 	T->sx += dx * 110 * ui;
-	clamp_scroll();
-	view_dirty = 1;
+	scroll_y(-dy * 110 * ui);
 }
 
 void core_key(int key, int mods)
 {
 	int ctrl = mods & LMOD_CTRL, shift = mods & LMOD_SHIFT, cur;
+	Row *row;
 	dirty = 1;
 	/* raccourcis globaux (onglets, fichiers), actifs même pendant une saisie */
 	if (ctrl) {
@@ -3043,32 +3304,29 @@ void core_key(int key, int mods)
 	}
 	if (!has_doc()) return;
 	cur = current_page();
+	row = &T->rows[T->pages[cur].row];
 	switch (key) {
 	case K_PGUP:
-		if (T->pages[cur].ph + 2 * gap > vh && T->sy > T->pages[cur].top - gap + 2) {
-			T->sy = T->pages[cur].top - gap;
+		if (row->h + 2 * gap > vh && T->sy > row->top - gap + 2) {
+			T->sy = row->top - gap;
 			clamp_scroll();
 			view_dirty = 1;
-		} else goto_page(cur - 1);
+		} else if (T->pages[cur].row > 0) goto_row(T->pages[cur].row - 1);
 		break;
-	case K_PGDN: goto_page(cur + 1); break;
+	case K_PGDN: if (T->pages[cur].row < T->nrows - 1) goto_row(T->pages[cur].row + 1); break;
 	case K_HOME: goto_page(0); break;
 	case K_END: goto_page(T->npages - 1); break;
-	case K_UP: T->sy -= 60 * ui; clamp_scroll(); view_dirty = 1; break;
-	case K_DOWN: T->sy += 60 * ui; clamp_scroll(); view_dirty = 1; break;
+	case K_UP: scroll_y(-60 * ui); break;
+	case K_DOWN: scroll_y(60 * ui); break;
 	case K_LEFT:
-		if (T->cw <= vw) goto_page(cur - 1);
+		if (T->cw <= vw) { if (T->pages[cur].row > 0) goto_row(T->pages[cur].row - 1); }
 		else { T->sx -= 60 * ui; clamp_scroll(); view_dirty = 1; }
 		break;
 	case K_RIGHT:
-		if (T->cw <= vw) goto_page(cur + 1);
+		if (T->cw <= vw) { if (T->pages[cur].row < T->nrows - 1) goto_row(T->pages[cur].row + 1); }
 		else { T->sx += 60 * ui; clamp_scroll(); view_dirty = 1; }
 		break;
-	case K_SPACE:
-		T->sy += (shift ? -0.9 : 0.9) * vh;
-		clamp_scroll();
-		view_dirty = 1;
-		break;
+	case K_SPACE: scroll_y((shift ? -0.9 : 0.9) * vh); break;
 	case K_PLUS: zoom_step(1, vw / 2.0, vh / 2.0); break;
 	case K_MINUS: zoom_step(-1, vw / 2.0, vh / 2.0); break;
 	}
@@ -3105,6 +3363,9 @@ void core_char(unsigned c)
 	case 'l': case 'L': case 'w': case 'W': apply_fit(FIT_WIDTH, current_page(), 1); break;
 	case 'r': rotate(90); break;
 	case 'R': rotate(-90); break;
+	case 'd': set_view_mode(tab_view_mode(T) ^ VIEW_TWO_UP); break;
+	case 'D': set_view_mode((tab_view_mode(T) | VIEW_TWO_UP) ^ VIEW_COVER); break;
+	case 'c': case 'C': set_view_mode(tab_view_mode(T) ^ VIEW_CONTINUOUS); break;
 	default:
 		if (c >= '0' && c <= '9') {
 			char s[2] = { (char)c, 0 };
@@ -3263,6 +3524,7 @@ void core_shutdown(void)
 	if (icon_rot[1]) gfx_tex_free(icon_rot[1]);
 	if (icon_auto) gfx_tex_free(icon_auto);
 	if (icon_open) gfx_tex_free(icon_open);
+	if (icon_view) gfx_tex_free(icon_view);
 	for (i = 0; i < nclosed; i++) free(closed_paths[i]);
 	fz_drop_font(ctx, font_regular);
 	fz_drop_font(ctx, font_bold);

@@ -421,6 +421,38 @@ void platform_open_with(const char *path, int x, int y)
 	free(file);
 }
 
+int platform_popup_menu(const char *const *labels, const int *flags, int n, int right_x, int top_y)
+{
+	HMENU menu = CreatePopupMenu();
+	POINT pt;
+	int i, cmd;
+	for (i = 0; i < n; i++) {
+		if (flags[i] & MENU_SEPARATOR) AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+		else {
+			wchar_t *w = to_wide(labels[i]);
+			UINT f = MF_STRING;
+			if (flags[i] & MENU_DISABLED) f |= MF_GRAYED;
+			if (flags[i] & (MENU_CHECKED | MENU_TICKED)) f |= MF_CHECKED;
+			AppendMenuW(menu, f, (UINT_PTR)(i + 1), w);
+			if (flags[i] & MENU_CHECKED) {   /* choix exclusif : puce au lieu de la coche */
+				MENUITEMINFOW mi;
+				memset(&mi, 0, sizeof mi);
+				mi.cbSize = sizeof mi;
+				mi.fMask = MIIM_FTYPE;
+				mi.fType = MFT_STRING | MFT_RADIOCHECK;
+				SetMenuItemInfoW(menu, (UINT)(i + 1), FALSE, &mi);
+			}
+			free(w);
+		}
+	}
+	pt.x = right_x;
+	pt.y = top_y;
+	ClientToScreen(hwnd, &pt);
+	cmd = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, NULL);
+	DestroyMenu(menu);
+	return cmd > 0 ? cmd - 1 : -1;
+}
+
 void platform_set_clipboard(const char *utf8)
 {
 	wchar_t *w = to_wide(utf8);
@@ -464,13 +496,15 @@ void platform_toggle_fullscreen(void)
 
 /* ---------- réglages (registre : HKCU\Software\Lire) ---------- */
 
-static void load_settings(int *wheel, WINDOWPLACEMENT *wp, int *has_wp)
+static void load_settings(int *wheel, int *view, WINDOWPLACEMENT *wp, int *has_wp)
 {
 	HKEY k;
 	DWORD v, sz;
 	if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Lire", 0, KEY_READ, &k) != ERROR_SUCCESS) return;
 	sz = sizeof v;
 	if (RegQueryValueExW(k, L"WheelZoom", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) *wheel = (int)v;
+	sz = sizeof v;
+	if (RegQueryValueExW(k, L"Affichage", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) *view = (int)v;
 	sz = sizeof *wp;
 	if (RegQueryValueExW(k, L"Window", NULL, NULL, (BYTE *)wp, &sz) == ERROR_SUCCESS && sz == sizeof *wp)
 		*has_wp = 1;
@@ -484,6 +518,8 @@ static void save_settings(void)
 	WINDOWPLACEMENT wp;
 	if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Lire", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) return;
 	RegSetValueExW(k, L"WheelZoom", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+	v = (DWORD)core_view_mode();
+	RegSetValueExW(k, L"Affichage", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
 	if (fullscreen) wp = saved_wp;
 	else { wp.length = sizeof wp; GetWindowPlacement(hwnd, &wp); }
 	RegSetValueExW(k, L"Window", 0, REG_BINARY, (const BYTE *)&wp, sizeof wp);
@@ -805,7 +841,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 	WNDCLASSEXW wc;
 	WINDOWPLACEMENT wpl;
 	HMODULE u32 = GetModuleHandleW(L"user32.dll");
-	int wheel = 0, has_wp = 0, argc = 0;
+	int wheel = 0, view = VIEW_CONTINUOUS, has_wp = 0, argc = 0;
 	UINT dpi = 96;
 	RECT rc;
 	MSG m;
@@ -870,7 +906,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 
 	memset(&wpl, 0, sizeof wpl);
 	wpl.length = sizeof wpl;
-	load_settings(&wheel, &wpl, &has_wp);
+	load_settings(&wheel, &view, &wpl, &has_wp);
 
 	hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, L"LireFenetre", L"Lire", WS_OVERLAPPEDWINDOW,
 			CW_USEDEFAULT, CW_USEDEFAULT, 1400, 950, NULL, NULL, inst, NULL);
@@ -885,6 +921,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 		return 1;
 	}
 	core_set_wheel_zoom(wheel);
+	core_set_view_mode(view);
 	if (get_dpi) dpi = get_dpi(hwnd);
 	core_set_dpi((float)dpi);
 

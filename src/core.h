@@ -22,6 +22,12 @@ void core_open(const char *path);        /* chemin UTF-8 ; ouvre un nouvel ongle
 void core_reload(void);                  /* recharge l'onglet actif */
 void core_resize(int w, int h);          /* taille de la zone cliente en pixels */
 void core_set_dpi(float dpi);
+/* mode d'affichage (bits) : deux pages côte à côte, page de garde seule, défilement continu */
+enum { VIEW_TWO_UP = 1, VIEW_COVER = 2, VIEW_CONTINUOUS = 4 };
+void core_set_view_mode(int flags);     /* mode des prochains fichiers ouverts (réglage mémorisé) */
+int  core_view_mode(void);
+/* menu contextuel : drapeaux par ligne */
+enum { MENU_CHECKED = 1, MENU_DISABLED = 2, MENU_SEPARATOR = 4, MENU_TICKED = 8 };
 void core_set_wheel_zoom(int on);
 int  core_wheel_zoom(void);
 
@@ -55,6 +61,8 @@ void   core_stats(char *buf, int len);
 void   platform_wake(void);                  /* appelable depuis n'importe quel thread */
 void   platform_set_title(const char *utf8);
 void   platform_open_dialog(void);
+/* menu déroulant sous un bouton de la barre ; rend l'indice choisi ou -1 (libellés UTF-8, « \t » avant le raccourci) */
+int    platform_popup_menu(const char *const *labels, const int *flags, int n, int right_x, int top_y);
 void   platform_set_clipboard(const char *utf8);
 void   platform_open_with(const char *utf8_path, int right_x, int top_y);   /* menu « Ouvrir avec » sous le bouton */
 void   platform_toggle_fullscreen(void);

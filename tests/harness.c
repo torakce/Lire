@@ -27,6 +27,7 @@ void platform_wake(void)
 }
 void platform_set_title(const char *s) { printf("  [titre] %s\n", s); }
 void platform_open_dialog(void) {}
+int platform_popup_menu(const char *const *l, const int *f, int n, int x, int y) { (void)l; (void)f; (void)n; (void)x; (void)y; return -1; }
 char last_clipboard[4096];
 void platform_set_clipboard(const char *t) { snprintf(last_clipboard, sizeof last_clipboard, "%s", t); }
 void platform_open_with(const char *p, int x, int y) { printf("  [ouvrir avec] %s (bouton %d,%d)\n", p, x, y); }
@@ -136,7 +137,7 @@ int main(int argc, char **argv)
 		core_open(file);
 		for (i = 0; i < 4000; i++) {
 			int a, x, y;
-			seed = seed * 1103515245 + 12345; a = (seed >> 16) % (nf > 0 ? 22 : 16);
+			seed = seed * 1103515245 + 12345; a = (seed >> 16) % (nf > 0 ? 26 : 16); if (nf <= 0 && (seed >> 8) % 5 == 0) a = 22 + (seed >> 20) % 4;
 			seed = seed * 1103515245 + 12345; x = (seed >> 16) % W;
 			seed = seed * 1103515245 + 12345; y = (seed >> 16) % H;
 			switch (a) {
@@ -153,6 +154,10 @@ int main(int argc, char **argv)
 			case 13: core_key(K_END, 0); break;
 			case 14: if (i % 97 == 0) core_reload(); break;
 			case 15: core_resize(W - (x % 400), H - (y % 300)); break;
+			case 22: core_char('d'); break;
+			case 23: if (i % 3 == 0) core_char('D'); break;
+			case 24: core_char('c'); break;
+			case 25: core_wheel(y & 1 ? 3 : -3, 0, x, y, 0); break;
 			/* onglets */
 			case 16: core_open(argv[5 + (x % nf)]); break;
 			case 17: if (core_tab_count() > 1 || (i % 5 == 0)) core_key('W', LMOD_CTRL); break;
@@ -172,6 +177,62 @@ int main(int argc, char **argv)
 		save("stress.png");
 		core_shutdown();
 		printf("stress OK, textures restantes : %ld octets\n", soft_tex_bytes);
+		return 0;
+	}
+	if (argc > 4 && !strcmp(argv[4], "modes")) {
+		/* modes d'affichage : deux pages, page de garde, page par page */
+		char st[256];
+		core_open(file);
+		pump("ouverture (une page, continu)", 120);
+		core_char('f');
+		pump("page entière", 120);
+		save("m01_une_page.png");
+		core_char('d');
+		pump("deux pages, continu", 120);
+		save("m02_deux_pages.png");
+		core_key(K_PGDN, 0);
+		pump("  page suivante (rangée 2)", 120);
+		save("m03_deux_pages_rangee2.png");
+		core_char('D');
+		pump("page de garde séparée", 120);
+		save("m04_garde_rangee.png");
+		core_key(K_HOME, LMOD_CTRL);
+		pump("  début : page de garde seule", 120);
+		save("m05_garde_seule.png");
+		core_char('c');
+		pump("page par page (deux pages + garde)", 120);
+		save("m06_page_par_page_garde.png");
+		for (i = 0; i < 3; i++) {
+			core_wheel(-1, 0, W / 2, H / 2, 0);
+			snprintf(name, sizeof name, "  molette bas -> rangée suivante (%d)", i + 1);
+			pump(name, 120);
+		}
+		save("m07_page_par_page_r4.png");
+		core_stats(st, sizeof st); printf("  %s\n", st);
+		core_wheel(1, 0, W / 2, H / 2, 0);
+		pump("  molette haut -> rangée précédente", 120);
+		core_stats(st, sizeof st); printf("  %s\n", st);
+		core_char('d');
+		pump("une page, page par page", 120);
+		save("m08_une_page_par_page.png");
+		core_key(K_END, 0);
+		pump("  dernière page", 120);
+		core_stats(st, sizeof st); printf("  %s\n", st);
+		for (i = 0; i < 4; i++) core_wheel(1, 0, W / 2, H / 2, LMOD_CTRL);
+		pump("  zoom x2,5", 120);
+		for (i = 0; i < 40; i++) core_wheel(-1, 0, W / 2, H / 2, 0);
+		pump("  défilement jusqu'en bas (reste sur la dernière)", 120);
+		core_stats(st, sizeof st); printf("  %s\n", st);
+		for (i = 0; i < 60; i++) core_wheel(1, 0, W / 2, H / 2, 0);
+		pump("  défilement vers le haut (pages précédentes)", 120);
+		core_stats(st, sizeof st); printf("  %s\n", st);
+		save("m09_zoom_page_par_page.png");
+		core_char('c');
+		core_char('f');
+		pump("retour : une page, continu", 120);
+		core_stats(st, sizeof st); printf("  %s\n", st);
+		core_shutdown();
+		printf("textures restantes : %ld octets\n", soft_tex_bytes);
 		return 0;
 	}
 	if (argc > 4 && !strcmp(argv[4], "texte")) {

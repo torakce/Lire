@@ -34,11 +34,19 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 | Page précédente / suivante | `Pg.Préc` / `Pg.Suiv` (et ← / → quand la page tient en largeur) |
 | Première / dernière page | `Début` / `Fin` |
 | Aller à la page | `Ctrl+G` ou taper directement le numéro (pavé numérique) |
+| Une page ↔ deux pages côte à côte | Bouton « Affichage » en haut à droite, ou `D` |
+| Page de garde séparée (en deux pages) | Bouton « Affichage », ou `Maj+D` |
+| Défilement continu ↔ page par page | Bouton « Affichage », ou `C` |
 | Rotation horaire / antihoraire | Boutons ↻ / ↺ en haut à droite, `R` / `Maj+R`, ou `Ctrl+Maj++` / `Ctrl+Maj+-` |
 | Molette = zoom ↔ défilement | `M` (mémorisé) |
 | Recharger le fichier (après un nouvel export) | `F5` |
 | Plein écran | `F11` |
 | Aide | `F1` ou `H` |
+
+Modes d'affichage (mémorisés d'une session à l'autre) : **deux pages** côte à côte, avec en option la **page de garde
+séparée** (la première page reste seule, à droite, puis 2–3, 4–5…) ; **continu** (toutes les pages défilent) ou
+**page par page** (une page ou une double page à la fois : arrivé en bas, la molette passe à la suivante).
+« Page entière » et « pleine largeur » s'ajustent à la double page.
 
 « Ouvrir avec » propose les logiciels que Windows recommande pour les PDF, puis ceux déjà choisis via
 « Choisir un programme… » (pratique pour un logiciel portable comme Annoter, que Windows ne connaît pas) ;
