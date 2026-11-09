@@ -39,7 +39,7 @@ static int swallow_char;
 static int fullscreen;
 static WINDOWPLACEMENT saved_wp;
 static int buttons;
-static HCURSOR cur_arrow, cur_hand, cur_cross;
+static HCURSOR cur_arrow, cur_hand, cur_cross, cur_text;
 static int tracking;
 static HICON menu_icons[64];   /* icônes du menu « Ouvrir avec » (par identifiant de commande) */
 static int menu_icon_px = 16;
@@ -421,6 +421,26 @@ void platform_open_with(const char *path, int x, int y)
 	free(file);
 }
 
+void platform_set_clipboard(const char *utf8)
+{
+	wchar_t *w = to_wide(utf8);
+	size_t n = (wcslen(w) + 1) * sizeof *w;
+	HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
+	if (g) {
+		void *dst = GlobalLock(g);
+		memcpy(dst, w, n);
+		GlobalUnlock(g);
+		if (OpenClipboard(hwnd)) {
+			EmptyClipboard();
+			if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
+			CloseClipboard();
+		} else {
+			GlobalFree(g);
+		}
+	}
+	free(w);
+}
+
 void platform_toggle_fullscreen(void)
 {
 	if (!fullscreen) {
@@ -517,6 +537,7 @@ static void update_cursor(void)
 	switch (core_cursor()) {
 	case CUR_HAND: case CUR_AUTO: SetCursor(cur_hand); break;
 	case CUR_CROSS: SetCursor(cur_cross); break;
+	case CUR_TEXT: SetCursor(cur_text); break;
 	default: SetCursor(cur_arrow); break;
 	}
 }
@@ -626,6 +647,18 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 		SetCapture(h);
 		buttons |= 1 << b;
 		core_mouse_down(b, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mods());
+		update_cursor();
+		refresh();
+		return 0;
+	}
+
+	case WM_LBUTTONDBLCLK: {
+		/* double-clic : un mot sous le curseur, sinon c'est un clic ordinaire */
+		SetFocus(h);
+		SetCapture(h);
+		buttons |= 1 << BTN_LEFT;
+		if (!core_mouse_double(BTN_LEFT, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mods()))
+			core_mouse_down(BTN_LEFT, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mods());
 		update_cursor();
 		refresh();
 		return 0;
@@ -822,10 +855,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 	cur_arrow = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
 	cur_hand = LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL);
 	cur_cross = LoadCursorW(NULL, (LPCWSTR)IDC_CROSS);
+	cur_text = LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM);
 
 	memset(&wc, 0, sizeof wc);
 	wc.cbSize = sizeof wc;
-	wc.style = CS_OWNDC;
+	wc.style = CS_OWNDC | CS_DBLCLKS;
 	wc.lpfnWndProc = wndproc;
 	wc.hInstance = inst;
 	wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));

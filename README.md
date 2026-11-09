@@ -25,7 +25,9 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 | Défiler | Molette, flèches, Espace / Maj+Espace |
 | Zoomer / dézoomer (autour du curseur) | Ctrl+Molette, `+` / `-` |
 | Zoom sur une zone | Clic droit + glisser un rectangle |
-| Déplacer la vue | Clic gauche + glisser |
+| Déplacer la vue | Clic gauche + glisser (hors du texte) |
+| Sélectionner du texte | Clic gauche + glisser **sur** le texte (comme Acrobat) ; double-clic : un mot ; `Maj`+clic : étendre |
+| Copier le texte sélectionné / tout le texte de la page | `Ctrl+C` / `Ctrl+A` puis `Ctrl+C` |
 | Défilement automatique | Maintenir le clic molette : la vue file dans la direction du curseur, d'autant plus vite qu'il est loin du point de départ ; elle s'arrête au relâchement |
 | Page entière / pleine largeur | `F` ou `Ctrl+0` / `L` ou `Ctrl+2` |
 | Taille réelle (100 %) | `Ctrl+1` |
@@ -41,6 +43,10 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 « Ouvrir avec » propose les logiciels que Windows recommande pour les PDF, puis ceux déjà choisis via
 « Choisir un programme… » (pratique pour un logiciel portable comme Annoter, que Windows ne connaît pas) ;
 « Autres applications (Windows)… » ouvre la fenêtre standard, sans jamais changer le logiciel par défaut.
+
+Sélection de texte : le curseur devient une barre verticale au-dessus d'un texte. Le texte de chaque page affichée est
+extrait en tâche de fond depuis sa display list (quelques dizaines de ms, sans effet sur l'affichage). Si un plan
+a été exporté avec les textes « vectorisés » (transformés en traits), il n'y a pas de texte à sélectionner.
 
 La barre de défilement de droite est saisissable ; en la faisant glisser, le numéro de page s'affiche.
 La rotation s'applique à tout le document de l'onglet ; l'angle courant est rappelé dans la barre d'état.

@@ -12,7 +12,7 @@ enum {
 	K_TAB, K_F4
 };
 
-enum { CUR_ARROW, CUR_HAND, CUR_CROSS, CUR_AUTO };
+enum { CUR_ARROW, CUR_HAND, CUR_CROSS, CUR_AUTO, CUR_TEXT };
 enum { INPUT_NONE, INPUT_GOTO, INPUT_PASSWORD };
 
 int  core_init(int nthreads);            /* 0 si OK ; nthreads <= 0 : automatique */
@@ -34,6 +34,7 @@ int  core_view_complete(void);           /* 1 si toute la zone visible est nette
 
 void core_mouse_down(int btn, int x, int y, int mods);
 void core_mouse_up(int btn, int x, int y, int mods);
+int  core_mouse_double(int btn, int x, int y, int mods);   /* double-clic : 1 si traité (mot sélectionné) */
 void core_mouse_move(int x, int y, int mods);
 void core_mouse_leave(void);
 void core_wheel(float dy, float dx, int x, int y, int mods);   /* dy>0 : vers le haut, dx>0 : vers la droite */
@@ -54,6 +55,7 @@ void   core_stats(char *buf, int len);
 void   platform_wake(void);                  /* appelable depuis n'importe quel thread */
 void   platform_set_title(const char *utf8);
 void   platform_open_dialog(void);
+void   platform_set_clipboard(const char *utf8);
 void   platform_open_with(const char *utf8_path, int right_x, int top_y);   /* menu « Ouvrir avec » sous le bouton */
 void   platform_toggle_fullscreen(void);
 void   platform_quit(void);

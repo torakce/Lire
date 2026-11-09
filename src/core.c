@@ -52,7 +52,7 @@
 enum { L_NONE, L_QUEUED, L_BUILDING, L_READY, L_ERROR };
 enum { J_IDLE, J_QUEUED, J_RUNNING, J_DONE, J_READY, J_FAILED };
 enum { FIT_NONE, FIT_PAGE, FIT_WIDTH };
-enum { DRAG_NONE, DRAG_PAN, DRAG_ZOOM, DRAG_VBAR, DRAG_HBAR, DRAG_AUTO };
+enum { DRAG_NONE, DRAG_PAN, DRAG_ZOOM, DRAG_VBAR, DRAG_HBAR, DRAG_AUTO, DRAG_SELECT };
 enum { HIT_NONE = 0, HIT_PLUS, HIT_OPENWITH, HIT_ROT_CCW, HIT_ROT_CW, HIT_TAB = 100000, HIT_CLOSE = 200000 };
 
 typedef struct Job Job;
@@ -90,6 +90,8 @@ typedef struct {
 	int bounds_differ;
 	int urgent;             /* page visible (à analyser avant les autres) */
 	size_t lbytes;          /* mémoire de la display list */
+	fz_stext_page *stext;   /* texte de la page (sélection), extrait à la demande depuis la display list */
+	int sstate;
 	Job *ready;
 } Page;
 
@@ -490,13 +492,57 @@ static fz_document *open_extra(fz_context *c, const char *path, const char *pw, 
 	return d;
 }
 
+/* (sous mu) page dont le texte est à extraire (pages visibles seulement), -1 sinon */
+static int queued_stext(Tab *t)
+{
+	int k;
+	for (k = 0; k < t->npages; k++)
+		if (t->pages[k].sstate == L_QUEUED) return k;
+	return -1;
+}
+
 /* (sous mu) prochaine page en attente d'analyse, sans la retirer de la file */
 static int queued_page(Tab *t)
 {
 	int k;
 	for (k = t->lq_pos; k < t->nlq; k++)
 		if (t->lq[k] < t->npages && t->pages[t->lq[k]].lstate == L_QUEUED) return 1;
-	return 0;
+	return queued_stext(t) >= 0;
+}
+
+/* (sous mu, relâché pendant le travail) extrait le texte d'une page depuis sa display list */
+static void build_stext(int k, fz_context *c, Tab *t, int i)
+{
+	Page *p = &t->pages[i];
+	fz_display_list *list;
+	fz_stext_page *sp = NULL;
+	if (p->lstate != L_READY || !p->list) { p->sstate = L_NONE; return; }
+	p->sstate = L_BUILDING;
+	list = fz_keep_display_list(c, p->list);
+	loader_busy[k] = 1;
+	loader_tab[k] = t;
+	loader_page[k] = -1;
+	mutex_unlock(&mu);
+	fz_var(sp);
+	fz_try(c) {
+		fz_stext_options opts;
+		fz_init_stext_options(c, &opts);
+		sp = fz_new_stext_page_from_display_list(c, list, &opts);
+	}
+	fz_catch(c)
+		sp = NULL;
+	fz_drop_display_list(c, list);
+	mutex_lock(&mu);
+	loader_busy[k] = 0;
+	loader_tab[k] = NULL;
+	if (p->sstate == L_BUILDING) {
+		p->stext = sp;
+		p->sstate = sp ? L_READY : L_ERROR;
+	} else {
+		fz_drop_stext_page(c, sp);   /* annulé entre-temps */
+	}
+	resched = 1;
+	cond_broadcast(&cv_idle);
 }
 
 static int any_loader_busy(void)
@@ -522,6 +568,21 @@ static void loader_main(void *arg)
 		if (paused || !t || !t->doc || t->need_password || !t->pages || !queued_page(t)) {
 			cond_wait(&cv_load, &mu);
 			continue;
+		}
+		/* texte d'une page visible (sélection) : avant l'analyse des pages lointaines */
+		{
+			int nx = -1, si;
+			while (t->lq_pos < t->nlq && !(t->lq[t->lq_pos] < t->npages && t->pages[t->lq[t->lq_pos]].lstate == L_QUEUED))
+				t->lq_pos++;
+			if (t->lq_pos < t->nlq) nx = t->lq[t->lq_pos];
+			if ((nx < 0 || !t->pages[nx].urgent) && (si = queued_stext(t)) >= 0) {
+				build_stext(k, c, t, si);
+				mutex_unlock(&mu);
+				platform_wake();
+				mutex_lock(&mu);
+				continue;
+			}
+			if (nx < 0) { cond_wait(&cv_load, &mu); continue; }
 		}
 		d = k == 0 ? t->doc : t->ldoc[k];
 		if (!d) {
@@ -588,6 +649,15 @@ static void loader_main(void *arg)
 		mutex_lock(&mu);
 	}
 	mutex_unlock(&mu);
+}
+
+/* libère le texte extrait d'une page (pas pendant son extraction) */
+static void drop_stext(Page *p)
+{
+	if (p->sstate == L_BUILDING) { p->sstate = L_NONE; return; }   /* le chargeur le jettera */
+	fz_drop_stext_page(ctx, p->stext);
+	p->stext = NULL;
+	p->sstate = L_NONE;
 }
 
 /* (sous mu) libère la display list d'une page */
@@ -677,6 +747,7 @@ static void trim_tab(Tab *t)
 	for (i = 0; i < t->npages; i++) {
 		Page *p = &t->pages[i];
 		if (p->lstate == L_READY && !(p->lused == t->last_gen && p->urgent)) drop_list(t, p);
+		if (!(p->lused == t->last_gen && p->urgent)) drop_stext(p);
 	}
 	mutex_unlock(&mu);
 }
@@ -714,8 +785,10 @@ static void tab_clear(Tab *t)
 {
 	int i;
 	flush_jobs(t);
-	for (i = 0; i < t->npages; i++)
+	for (i = 0; i < t->npages; i++) {
 		fz_drop_display_list(ctx, t->pages[i].list);
+		fz_drop_stext_page(ctx, t->pages[i].stext);
+	}
 	free(t->pages);
 	t->pages = NULL;
 	t->npages = 0;
@@ -941,6 +1014,172 @@ static void sync_view(void)
 	view_dirty = dirty = 1;
 }
 
+/* ---------- sélection de texte ---------- */
+
+#define MAX_SELQ 8192
+static Tab *sel_tab;
+static int sel_on, sel_page, sel_moved, sel_dirty, hover_text;
+static fz_point sel_a, sel_b;
+static fz_quad selq[MAX_SELQ];
+static int nselq;
+
+static void clear_selection(void)
+{
+	if (sel_on) dirty = 1;
+	sel_on = 0;
+	sel_tab = NULL;
+	nselq = 0;
+}
+
+/* point de la vue (x, y) -> page sous le curseur et point dans l'espace de la page (sans rotation) */
+static int view_to_page(double x, double y, int *page, fz_point *pt, int clamp)
+{
+	Tab *t = T;
+	Page *p;
+	double X, Y, u, v;
+	int i;
+	if (!has_doc()) return 0;
+	i = clamp && sel_on ? sel_page : page_at_y(t->sy + y);
+	if (i < 0 || i >= t->npages) return 0;
+	p = &t->pages[i];
+	X = p->left - floor(t->sx);
+	Y = p->top - floor(t->sy);
+	u = x - X;
+	v = y - Y;
+	if (!clamp && (u < 0 || v < 0 || u >= p->pw || v >= p->ph)) return 0;
+	u = clampd(u, 0, p->pw);
+	v = clampd(v, 0, p->ph);
+	*pt = fz_transform_point(fz_make_point((float)(u + p->pbox.x0), (float)(v + p->pbox.y0)),
+			fz_invert_matrix(view_ctm(t->rot, t->scale)));
+	*page = i;
+	return 1;
+}
+
+/* ligne de texte sous le point (espace page), NULL sinon */
+static fz_stext_line *line_at(fz_stext_block *b, fz_point pt)
+{
+	float m = 0.5f;
+	for (; b; b = b->next) {
+		if (pt.x < b->bbox.x0 - m || pt.x > b->bbox.x1 + m || pt.y < b->bbox.y0 - m || pt.y > b->bbox.y1 + m) continue;
+		if (b->type == FZ_STEXT_BLOCK_TEXT) {
+			fz_stext_line *l;
+			for (l = b->u.t.first_line; l; l = l->next)
+				if (pt.x >= l->bbox.x0 - m && pt.x <= l->bbox.x1 + m && pt.y >= l->bbox.y0 - m && pt.y <= l->bbox.y1 + m)
+					return l;
+		} else if (b->type == FZ_STEXT_BLOCK_STRUCT && b->u.s.down) {
+			fz_stext_line *l = line_at(b->u.s.down->first_block, pt);
+			if (l) return l;
+		}
+	}
+	return NULL;
+}
+
+static int text_at_blocks(fz_stext_block *b, fz_point pt) { return line_at(b, pt) != NULL; }
+
+/* Ramène le point sur l'axe de la ligne de texte qu'il touche : MuPDF considère qu'un point
+   situé dans la moitié basse d'une ligne est « après » elle, ce qui rendait la sélection vide
+   quand on cliquait un peu bas sur un texte. */
+static fz_point snap_to_line(fz_stext_page *sp, fz_point pt)
+{
+	fz_stext_line *l = sp ? line_at(sp->first_block, pt) : NULL;
+	if (l) {
+		fz_point c = fz_make_point((l->bbox.x0 + l->bbox.x1) / 2, (l->bbox.y0 + l->bbox.y1) / 2);
+		float d = (pt.x - c.x) * l->dir.x + (pt.y - c.y) * l->dir.y;
+		pt = fz_make_point(c.x + l->dir.x * d, c.y + l->dir.y * d);
+	}
+	return pt;
+}
+
+static int text_at(double x, double y)
+{
+	fz_point pt;
+	int i;
+	Page *p;
+	if (!view_to_page(x, y, &i, &pt, 0)) return 0;
+	p = &T->pages[i];
+	return p->sstate == L_READY && p->stext && text_at_blocks(p->stext->first_block, pt);
+}
+
+static void update_selection(void)
+{
+	Page *p;
+	nselq = 0;
+	if (!sel_on || sel_tab != T || !has_doc() || sel_page >= T->npages) return;
+	p = &T->pages[sel_page];
+	if (p->sstate != L_READY || !p->stext) return;
+	fz_try(ctx)
+		nselq = fz_highlight_selection(ctx, p->stext, snap_to_line(p->stext, sel_a), snap_to_line(p->stext, sel_b), selq, MAX_SELQ);
+	fz_catch(ctx)
+		nselq = 0;
+	dirty = 1;
+}
+
+/* double-clic : le mot sous le curseur (triple : la ligne) */
+static void select_unit(int x, int y, int mode)
+{
+	fz_point pt, a, b;
+	int i;
+	Page *p;
+	if (!view_to_page(x, y, &i, &pt, 0)) return;
+	p = &T->pages[i];
+	if (p->sstate != L_READY || !p->stext || !text_at_blocks(p->stext->first_block, pt)) return;
+	a = b = pt;
+	fz_try(ctx)
+		fz_snap_selection(ctx, p->stext, &a, &b, mode);
+	fz_catch(ctx)
+		return;
+	sel_on = 1;
+	sel_tab = T;
+	sel_page = i;
+	sel_a = a;
+	sel_b = b;
+	sel_moved = 1;
+	update_selection();
+}
+
+static void copy_selection(void)
+{
+	Page *p;
+	char *txt = NULL;
+	if (sel_dirty) { sel_dirty = 0; update_selection(); }
+	if (!sel_on || sel_tab != T || !has_doc() || nselq == 0) return;
+	p = &T->pages[sel_page];
+	if (!p->stext) return;
+	fz_var(txt);
+	fz_try(ctx) {
+		txt = fz_copy_selection(ctx, p->stext, snap_to_line(p->stext, sel_a), snap_to_line(p->stext, sel_b), 1);
+		if (txt && txt[0]) {
+			char msg[64];
+			int n = 0;
+			const char *q;
+			platform_set_clipboard(txt);
+			for (q = txt; *q; q++) if ((*q & 0xc0) != 0x80) n++;
+			snprintf(msg, sizeof msg, "Texte copi\xc3\xa9 (%d caract\xc3\xa8re%s)", n, n > 1 ? "s" : "");
+			set_toast(msg);
+		}
+	}
+	fz_always(ctx)
+		fz_free(ctx, txt);
+	fz_catch(ctx) {}
+}
+
+static void select_all(void)
+{
+	Page *p;
+	int i;
+	if (!has_doc()) return;
+	i = current_page();
+	p = &T->pages[i];
+	if (p->sstate != L_READY || !p->stext) { set_toast("Texte de la page en cours d'analyse\xe2\x80\xa6"); return; }
+	sel_on = 1;
+	sel_tab = T;
+	sel_page = i;
+	sel_a = fz_make_point(p->stext->mediabox.x0, p->stext->mediabox.y0);
+	sel_b = fz_make_point(p->stext->mediabox.x1, p->stext->mediabox.y1);
+	update_selection();
+	if (nselq == 0) set_toast("Aucun texte s\xc3\xa9lectionnable sur cette page");
+}
+
 /* ---------- planification ---------- */
 
 /* Tuiles du niveau L couvrant la partie de la page p visible à l'écran, élargie
@@ -1079,6 +1318,24 @@ static void evict(void)
 		free(idx);
 	}
 
+	/* textes extraits : au plus 6 pages hors écran */
+	{
+		int ns = 0;
+		for (k = 0; k < t->npages; k++)
+			if (t->pages[k].sstate == L_READY) ns++;
+		if (ns > 6) {
+			mutex_lock(&mu);
+			for (k = 0; k < t->npages && ns > 6; k++) {
+				Page *p = &t->pages[k];
+				if (p->sstate == L_READY && !(p->lused == gen && p->urgent) && !(sel_on && sel_tab == t && sel_page == k)) {
+					drop_stext(p);
+					ns--;
+				}
+			}
+			mutex_unlock(&mu);
+		}
+	}
+
 	/* tuiles */
 	if (t->tex_bytes <= tex_budget && t->njobs < 40000) return;
 	evict_R = render_level(t, t->level);
@@ -1161,6 +1418,7 @@ static void schedule(void)
 			continue;
 		}
 		visible = k < nvis;
+		if (visible && p->sstate == L_NONE) p->sstate = L_QUEUED;   /* texte pour la sélection */
 		X = p->left - floor(t->sx);
 		Y = p->top - floor(t->sy);
 		pdist = hypot(X + p->pw / 2.0 - cx, Y + p->ph / 2.0 - cy);
@@ -1943,6 +2201,20 @@ static void draw_pages(void)
 					drawn = 1;
 				}
 			}
+		/* texte sélectionné : surlignage bleu translucide (les quadrilatères suivent les textes inclinés) */
+		if (sel_on && sel_tab == t && sel_page == i && nselq > 0) {
+			fz_matrix m = view_ctm(t->rot, t->scale);
+			int q;
+			for (q = 0; q < nselq; q++) {
+				fz_quad v = fz_transform_quad(selq[q], m);
+				float xy[8];
+				xy[0] = X + v.ul.x - p->pbox.x0; xy[1] = Y + v.ul.y - p->pbox.y0;
+				xy[2] = X + v.ur.x - p->pbox.x0; xy[3] = Y + v.ur.y - p->pbox.y0;
+				xy[4] = X + v.lr.x - p->pbox.x0; xy[5] = Y + v.lr.y - p->pbox.y0;
+				xy[6] = X + v.ll.x - p->pbox.x0; xy[7] = Y + v.ll.y - p->pbox.y0;
+				gfx_quad(xy, 0x5a2f7fe0);
+			}
+		}
 		if (p->pw > 160 * ui && p->ph > 40 * ui) {
 			const char *msg = NULL;
 			if (p->lstate == L_ERROR) msg = "Page illisible";
@@ -1965,7 +2237,9 @@ static const char *help_lines[][2] = {
 	{ "D\xc3\xa9""filer", "Molette, fl\xc3\xa8""ches, Espace" },
 	{ "Zoomer / d\xc3\xa9zoomer", "Ctrl+Molette,  +  /  -" },
 	{ "Zoom sur une zone", "Clic droit + glisser" },
-	{ "D\xc3\xa9placer la vue", "Clic gauche + glisser" },
+	{ "D\xc3\xa9placer la vue", "Clic gauche + glisser (hors du texte)" },
+	{ "S\xc3\xa9lectionner du texte", "Clic gauche + glisser sur le texte, double-clic : un mot" },
+	{ "Copier / tout s\xc3\xa9lectionner (page)", "Ctrl+C  /  Ctrl+A" },
 	{ "D\xc3\xa9""filement automatique", "Maintenir le clic molette, viser la direction" },
 	{ "Page enti\xc3\xa8re / pleine largeur", "F (Ctrl+0)  /  L (Ctrl+2)" },
 	{ "Taille r\xc3\xa9""elle (100 %)", "Ctrl+1" },
@@ -2136,6 +2410,7 @@ static void autoscroll_step(void)
 void core_draw(void)
 {
 	autoscroll_step();
+	if (sel_dirty) { sel_dirty = 0; update_selection(); }
 	if (view_dirty || need_schedule) {
 		view_dirty = need_schedule = 0;
 		schedule();
@@ -2184,6 +2459,7 @@ static void update_title(void)
 static void activate(int idx)
 {
 	if (idx < 0 || idx >= ntabs) return;
+	if (T && tabs[idx] != T) clear_selection();
 	if (T && tabs[idx] != T) {
 		stop_tab_work(T);
 		trim_tab(T);
@@ -2220,6 +2496,7 @@ static void close_tab(int idx)
 	int k, was_active = idx == active;
 	if (idx < 0 || idx >= ntabs) return;
 	t = tabs[idx];
+	if (sel_tab == t) clear_selection();
 	quiesce();
 	if (t->doc && !t->need_password) remember_closed(t->path);
 	if (was_active) T = NULL;
@@ -2378,6 +2655,7 @@ void core_reload(void)
 	cur = current_page();
 	ox = t->sx; oy = t->sy;
 	path = strdup(t->path);
+	if (sel_tab == t) clear_selection();
 	quiesce();
 	tab_clear(t);
 	fz_var(d);
@@ -2529,7 +2807,6 @@ void core_mouse_leave(void)
 void core_mouse_down(int btn, int x, int y, int mods)
 {
 	float a, b, c, d, t0, t1;
-	(void)mods;
 	dirty = 1;
 	if (show_help) { show_help = 0; return; }
 	if (y < bar_h) {
@@ -2566,7 +2843,28 @@ void core_mouse_down(int btn, int x, int y, int mods)
 			return;
 		}
 	}
-	if (btn == BTN_LEFT) { drag = DRAG_PAN; drag_btn = btn; mx0 = x; my0 = y; }
+	if (btn == BTN_LEFT) {
+		fz_point pt;
+		int i;
+		/* comme Acrobat : sur du texte, le clic gauche sélectionne ; ailleurs, il déplace la vue */
+		if (text_at(x, y) && view_to_page(x, y, &i, &pt, 0)) {
+			if ((mods & LMOD_SHIFT) && sel_on && sel_tab == T && sel_page == i) {
+				sel_b = pt;                 /* Maj+clic : étend la sélection */
+				sel_moved = 1;
+			} else {
+				sel_on = 1;
+				sel_tab = T;
+				sel_page = i;
+				sel_a = sel_b = pt;
+				sel_moved = 0;
+			}
+			update_selection();
+			drag = DRAG_SELECT; drag_btn = btn; mx0 = x; my0 = y;
+			return;
+		}
+		clear_selection();
+		drag = DRAG_PAN; drag_btn = btn; mx0 = x; my0 = y;
+	}
 	else if (btn == BTN_MIDDLE) { drag = DRAG_AUTO; drag_btn = btn; mx0 = x; my0 = y; auto_last = platform_time(); }
 	else if (btn == BTN_RIGHT) { drag = DRAG_ZOOM; drag_btn = btn; mx0 = x; my0 = y; }
 }
@@ -2592,6 +2890,22 @@ void core_mouse_move(int x, int y, int mods)
 	case DRAG_ZOOM:
 	case DRAG_AUTO:
 		dirty = 1;
+		break;
+	case DRAG_SELECT: {
+		fz_point pt;
+		int i;
+		if (abs(x - mx0) + abs(y - my0) > 2) sel_moved = 1;
+		if (sel_moved && view_to_page(x, y, &i, &pt, 1)) {
+			sel_b = pt;
+			sel_dirty = dirty = 1;   /* recalculé une fois par image (pages très chargées en texte) */
+		}
+		break;
+	}
+	case DRAG_NONE:
+		if (y >= 0) {
+			int ht = text_at(x, y);
+			if (ht != hover_text) hover_text = ht;
+		} else hover_text = 0;
 		break;
 	case DRAG_VBAR:
 		if (vbar(&a, &b, &c, &d, &t0, &t1)) {
@@ -2632,8 +2946,23 @@ void core_mouse_up(int btn, int x, int y, int mods)
 			clamp_scroll();
 		}
 	}
+	if (drag == DRAG_SELECT && !sel_moved) clear_selection();   /* simple clic sur du texte : désélectionne */
 	drag = DRAG_NONE;
 	view_dirty = dirty = 1;
+}
+
+/* double-clic gauche : sélectionne le mot sous le curseur ; 0 si pas de texte (clic ordinaire) */
+int core_mouse_double(int btn, int x, int y, int mods)
+{
+	(void)mods;
+	if (btn != BTN_LEFT || y < bar_h || !has_doc() || input_mode != INPUT_NONE) return 0;
+	y -= bar_h;
+	if (!text_at(x, y)) return 0;
+	select_unit(x, y, FZ_SELECT_WORDS);
+	mx = x; my = y;
+	drag = DRAG_NONE;
+	dirty = 1;
+	return 1;
 }
 
 void core_wheel(float dy, float dx, int x, int y, int mods)
@@ -2689,6 +3018,8 @@ void core_key(int key, int mods)
 	if (ctrl) {
 		switch (key) {
 		case 'G': start_goto(""); return;
+		case 'C': copy_selection(); return;
+		case 'A': select_all(); return;
 		case '0': apply_fit(FIT_PAGE, current_page(), 0); return;
 		case '1':
 			if (has_doc()) {
@@ -2708,7 +3039,7 @@ void core_key(int key, int mods)
 	case K_F1: show_help = !show_help; return;
 	case K_F5: core_reload(); return;
 	case K_F11: platform_toggle_fullscreen(); return;
-	case K_ESC: show_help = 0; toast[0] = 0; return;
+	case K_ESC: show_help = 0; toast[0] = 0; clear_selection(); return;
 	}
 	if (!has_doc()) return;
 	cur = current_page();
@@ -2788,6 +3119,7 @@ int core_cursor(void)
 {
 	if (drag == DRAG_PAN) return CUR_HAND;
 	if (drag == DRAG_AUTO) return CUR_AUTO;
+	if (drag == DRAG_SELECT || (drag == DRAG_NONE && hover_text && hover == HIT_NONE)) return CUR_TEXT;
 	if (drag == DRAG_ZOOM) return CUR_CROSS;
 	return CUR_ARROW;
 }

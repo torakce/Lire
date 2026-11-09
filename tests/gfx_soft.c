@@ -116,6 +116,18 @@ void gfx_rect(float x0, float y0, float x1, float y1, unsigned argb)
 			blend_px(fb + ((size_t)y * fbw + x) * 4, b * a / 255, g * a / 255, r * a / 255, a);
 }
 
+/* banc de test : le quadrilatère est approché par son rectangle englobant */
+void gfx_quad(const float *xy, unsigned argb)
+{
+	float x0 = xy[0], x1 = xy[0], y0 = xy[1], y1 = xy[1];
+	int k;
+	for (k = 1; k < 4; k++) {
+		x0 = fminf(x0, xy[2 * k]); x1 = fmaxf(x1, xy[2 * k]);
+		y0 = fminf(y0, xy[2 * k + 1]); y1 = fmaxf(y1, xy[2 * k + 1]);
+	}
+	gfx_rect(x0, y0, x1, y1, argb);
+}
+
 void gfx_end(void) {}
 
 unsigned char *soft_framebuffer(int *w, int *h)

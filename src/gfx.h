@@ -15,6 +15,8 @@ void gfx_begin(int w, int h, unsigned rgb);      /* début d'image, efface le fo
 void gfx_image(void *tex, float sx0, float sy0, float sx1, float sy1,
 		float x0, float y0, float x1, float y1, unsigned tint);
 void gfx_rect(float x0, float y0, float x1, float y1, unsigned argb);
+/* quadrilatère quelconque (4 sommets x,y dans l'ordre du contour), couleur ARGB non prémultipliée */
+void gfx_quad(const float *xy, unsigned argb);
 void gfx_origin(float x, float y);               /* décale les dessins suivants */
 void gfx_end(void);
 

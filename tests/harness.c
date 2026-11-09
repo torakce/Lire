@@ -27,6 +27,8 @@ void platform_wake(void)
 }
 void platform_set_title(const char *s) { printf("  [titre] %s\n", s); }
 void platform_open_dialog(void) {}
+char last_clipboard[4096];
+void platform_set_clipboard(const char *t) { snprintf(last_clipboard, sizeof last_clipboard, "%s", t); }
 void platform_open_with(const char *p, int x, int y) { printf("  [ouvrir avec] %s (bouton %d,%d)\n", p, x, y); }
 void platform_toggle_fullscreen(void) {}
 void platform_quit(void) {}
@@ -170,6 +172,77 @@ int main(int argc, char **argv)
 		save("stress.png");
 		core_shutdown();
 		printf("stress OK, textures restantes : %ld octets\n", soft_tex_bytes);
+		return 0;
+	}
+	if (argc > 4 && !strcmp(argv[4], "texte")) {
+		/* sélection de texte : survol (curseur texte), glisser, double-clic, Ctrl+C, Ctrl+A, clic dans le vide */
+		extern char last_clipboard[4096];
+		int x = -1, y = -1, gx, gy, ex = -1, ey = -1;
+		core_open(file);
+		pump("ouverture", 120);
+		for (gy = 120; gy < H - 60 && x < 0; gy += 7)
+			for (gx = 120; gx < W - 200 && x < 0; gx += 9) {
+				core_mouse_move(gx, gy, 0);
+				if (core_cursor() == CUR_TEXT) { x = gx; y = gy; }
+			}
+		for (gy = 60; gy < H - 60 && ex < 0; gy += 11) {
+			core_mouse_move(W / 2, gy, 0);
+			if (core_cursor() == CUR_ARROW) { ex = W / 2; ey = gy; }
+		}
+		printf("texte trouvé sous le curseur en (%d,%d), zone vide en (%d,%d)\n", x, y, ex, ey);
+		if (x < 0) { core_shutdown(); return 1; }
+		core_mouse_down(BTN_LEFT, x, y, 0);
+		printf("curseur pendant la sélection : %s\n", core_cursor() == CUR_TEXT ? "texte" : "AUTRE");
+		for (i = 1; i <= 10; i++) core_mouse_move(x + i * 40, y + i * 30, 0);
+		core_mouse_up(BTN_LEFT, x + 400, y + 300, 0);
+		core_draw();
+		save("x01_selection.png");
+		core_key('C', LMOD_CTRL);
+		printf("Ctrl+C après glisser : [%.200s]\n", last_clipboard);
+		last_clipboard[0] = 0;
+		if (!core_mouse_double(BTN_LEFT, x + 2, y, 0)) printf("!! double-clic non traité\n");
+		core_mouse_up(BTN_LEFT, x + 2, y, 0);
+		core_key('C', LMOD_CTRL);
+		printf("double-clic + Ctrl+C : [%s]\n", last_clipboard);
+		save("x02_mot.png");
+		if (ex >= 0) {
+			double before;
+			char st[256];
+			core_mouse_down(BTN_LEFT, ex, ey, 0);
+			printf("clic dans le vide : curseur %s\n", core_cursor() == CUR_HAND ? "main (déplacement)" : "AUTRE");
+			core_mouse_move(ex, ey - 120, 0);
+			core_mouse_up(BTN_LEFT, ex, ey - 120, 0);
+			last_clipboard[0] = 0;
+			core_key('C', LMOD_CTRL);
+			printf("après clic dans le vide, Ctrl+C : [%s] (vide attendu)\n", last_clipboard);
+			(void)before; (void)st;
+		}
+		core_key('A', LMOD_CTRL);
+		core_key('C', LMOD_CTRL);
+		printf("Ctrl+A + Ctrl+C : %d octets, début [%.120s]\n", (int)strlen(last_clipboard), last_clipboard);
+		core_draw();
+		save("x03_tout.png");
+		core_key(K_ESC, 0);
+		/* page tournée de 90° : la sélection doit suivre */
+		core_char('r');
+		pump("rotation 90", 120);
+		x = -1;
+		for (gy = 120; gy < H - 60 && x < 0; gy += 7)
+			for (gx = 120; gx < W - 200 && x < 0; gx += 9) {
+				core_mouse_move(gx, gy, 0);
+				if (core_cursor() == CUR_TEXT) { x = gx; y = gy; }
+			}
+		if (x >= 0) {
+			core_mouse_down(BTN_LEFT, x, y, 0);
+			for (i = 1; i <= 10; i++) core_mouse_move(x - i * 25, y + i * 25, 0);
+			core_mouse_up(BTN_LEFT, x - 250, y + 250, 0);
+			last_clipboard[0] = 0;
+			core_key('C', LMOD_CTRL);
+			printf("rotation 90 : texte en (%d,%d), Ctrl+C : [%.160s]\n", x, y, last_clipboard);
+			core_draw();
+			save("x04_rotation.png");
+		} else printf("!! rotation 90 : pas de texte trouvé\n");
+		core_shutdown();
 		return 0;
 	}
 	if (argc > 4 && !strcmp(argv[4], "auto")) {

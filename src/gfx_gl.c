@@ -187,6 +187,20 @@ void gfx_rect(float x0, float y0, float x1, float y1, unsigned argb)
 	glEnd();
 }
 
+void gfx_quad(const float *xy, unsigned argb)
+{
+	unsigned a = argb >> 24;
+	set_tex(0);
+	set_blend(a < 255 ? 2 : 0);
+	glColor4ub((GLubyte)((argb >> 16) & 255), (GLubyte)((argb >> 8) & 255), (GLubyte)(argb & 255), (GLubyte)a);
+	glBegin(GL_QUADS);
+	glVertex2f(xy[0], xy[1]);
+	glVertex2f(xy[2], xy[3]);
+	glVertex2f(xy[4], xy[5]);
+	glVertex2f(xy[6], xy[7]);
+	glEnd();
+}
+
 void gfx_origin(float x, float y)
 {
 	glMatrixMode(GL_MODELVIEW);

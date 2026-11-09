@@ -4,8 +4,8 @@
 1 24 "lire.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,2,2,0
-PRODUCTVERSION 1,2,2,0
+FILEVERSION 1,3,0,0
+PRODUCTVERSION 1,3,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -14,9 +14,9 @@ BEGIN
     BLOCK "040C04B0"
     BEGIN
       VALUE "FileDescription", "Lire - visionneuse PDF rapide"
-      VALUE "FileVersion", "1.2.2"
+      VALUE "FileVersion", "1.3.0"
       VALUE "ProductName", "Lire"
-      VALUE "ProductVersion", "1.2.2"
+      VALUE "ProductVersion", "1.3.0"
       VALUE "OriginalFilename", "Lire.exe"
       VALUE "LegalCopyright", "Moteur de rendu MuPDF (AGPL v3)"
     END
