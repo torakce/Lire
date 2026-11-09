@@ -171,6 +171,28 @@ int main(int argc, char **argv)
 		printf("stress OK, textures restantes : %ld octets\n", soft_tex_bytes);
 		return 0;
 	}
+	if (argc > 4 && !strcmp(argv[4], "auto")) {
+		/* défilement automatique au clic molette : la vue file vers le curseur, s'arrête au relâchement */
+		core_open(file);
+		pump("ouverture", 120);
+		for (i = 0; i < 4; i++) core_wheel(1, 0, W / 2, H / 2, LMOD_CTRL);
+		pump("zoom", 120);
+		save("a00_avant.png");
+		core_mouse_down(BTN_MIDDLE, 800, 500 + 34, 0);
+		core_mouse_move(805, 503 + 34, 0);   /* dans la zone morte : rien ne bouge */
+		t0 = platform_time();
+		while (platform_time() - t0 < 0.3) { core_poll(); core_draw(); wait_wake(0.016); }
+		printf("zone morte : vue_complete=%d\n", core_view_complete());
+		core_mouse_move(800, 700 + 34, 0);   /* 200 px vers le bas */
+		t0 = platform_time();
+		while (platform_time() - t0 < 1.0) { core_poll(); core_draw(); wait_wake(0.016); }
+		save("a01_autoscroll.png");
+		core_mouse_up(BTN_MIDDLE, 800, 700 + 34, 0);
+		pump("relâché : arrêt et vue nette", 120);
+		save("a02_arret.png");
+		core_shutdown();
+		return 0;
+	}
 	if (argc > 4 && !strcmp(argv[4], "quitter")) {
 		/* durée de l'arrêt (core_quick_exit) en plein travail de fond */
 		int k;

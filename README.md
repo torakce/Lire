@@ -24,7 +24,8 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 | Défiler | Molette, flèches, Espace / Maj+Espace |
 | Zoomer / dézoomer (autour du curseur) | Ctrl+Molette, `+` / `-` |
 | Zoom sur une zone | Clic droit + glisser un rectangle |
-| Déplacer la vue | Clic gauche (ou milieu) + glisser |
+| Déplacer la vue | Clic gauche + glisser |
+| Défilement automatique | Maintenir le clic molette : la vue file dans la direction du curseur, d'autant plus vite qu'il est loin du point de départ ; elle s'arrête au relâchement |
 | Page entière / pleine largeur | `F` ou `Ctrl+0` / `L` ou `Ctrl+2` |
 | Taille réelle (100 %) | `Ctrl+1` |
 | Page précédente / suivante | `Pg.Préc` / `Pg.Suiv` (et ← / → quand la page tient en largeur) |

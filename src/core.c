@@ -52,7 +52,7 @@
 enum { L_NONE, L_QUEUED, L_BUILDING, L_READY, L_ERROR };
 enum { J_IDLE, J_QUEUED, J_RUNNING, J_DONE, J_READY, J_FAILED };
 enum { FIT_NONE, FIT_PAGE, FIT_WIDTH };
-enum { DRAG_NONE, DRAG_PAN, DRAG_ZOOM, DRAG_VBAR, DRAG_HBAR };
+enum { DRAG_NONE, DRAG_PAN, DRAG_ZOOM, DRAG_VBAR, DRAG_HBAR, DRAG_AUTO };
 enum { HIT_NONE = 0, HIT_PLUS, HIT_ROT_CCW, HIT_ROT_CW, HIT_TAB = 100000, HIT_CLOSE = 200000 };
 
 typedef struct Job Job;
@@ -1528,6 +1528,70 @@ static void *make_rot_icon(int size, int clockwise)
 	return tex;
 }
 
+/* repère du défilement automatique (clic molette maintenu) : rond et 4 flèches */
+static void *icon_auto;
+static int icon_auto_size;
+
+static void *make_auto_icon(int size)
+{
+	fz_pixmap *pix = NULL;
+	fz_device *dev = NULL;
+	fz_path *disc = NULL, *arrows = NULL, *dot = NULL;
+	fz_stroke_state *ss = NULL;
+	void *tex = NULL;
+	fz_var(pix); fz_var(dev); fz_var(disc); fz_var(arrows); fz_var(dot); fz_var(ss);
+	fz_try(ctx) {
+		float c = size / 2.0f, r = size * 0.44f, dark[3] = { 0.13f, 0.14f, 0.16f }, light[3] = { 0.92f, 0.93f, 0.95f };
+		float a = size * 0.30f, w = size * 0.11f, h = size * 0.12f;
+		int k, n = 40;
+		pix = fz_new_pixmap(ctx, fz_device_bgr(ctx), size, size, NULL, 1);
+		fz_clear_pixmap(ctx, pix);
+		disc = fz_new_path(ctx);
+		dot = fz_new_path(ctx);
+		for (k = 0; k < n; k++) {
+			float t = k * 6.2831853f / n;
+			if (k == 0) {
+				fz_moveto(ctx, disc, c + r * cosf(t), c + r * sinf(t));
+				fz_moveto(ctx, dot, c + size * 0.07f * cosf(t), c + size * 0.07f * sinf(t));
+			} else {
+				fz_lineto(ctx, disc, c + r * cosf(t), c + r * sinf(t));
+				fz_lineto(ctx, dot, c + size * 0.07f * cosf(t), c + size * 0.07f * sinf(t));
+			}
+		}
+		fz_closepath(ctx, disc);
+		fz_closepath(ctx, dot);
+		arrows = fz_new_path(ctx);
+		for (k = 0; k < 4; k++) {   /* pointes vers le haut, la droite, le bas, la gauche */
+			float dx = k == 1 ? 1.0f : k == 3 ? -1.0f : 0.0f, dy = k == 0 ? -1.0f : k == 2 ? 1.0f : 0.0f;
+			float tx = c + dx * a, ty = c + dy * a, bx = c + dx * (a - h), by = c + dy * (a - h);
+			fz_moveto(ctx, arrows, tx, ty);
+			fz_lineto(ctx, arrows, bx - dy * w, by + dx * w);
+			fz_lineto(ctx, arrows, bx + dy * w, by - dx * w);
+			fz_closepath(ctx, arrows);
+		}
+		ss = fz_new_stroke_state(ctx);
+		ss->linewidth = fmaxf(1.0f, size * 0.05f);
+		dev = fz_new_draw_device(ctx, fz_identity, pix);
+		fz_fill_path(ctx, dev, disc, 0, fz_identity, fz_device_bgr(ctx), dark, 0.85f, fz_default_color_params);
+		fz_stroke_path(ctx, dev, disc, ss, fz_identity, fz_device_bgr(ctx), light, 0.9f, fz_default_color_params);
+		fz_fill_path(ctx, dev, arrows, 0, fz_identity, fz_device_bgr(ctx), light, 1, fz_default_color_params);
+		fz_fill_path(ctx, dev, dot, 0, fz_identity, fz_device_bgr(ctx), light, 1, fz_default_color_params);
+		fz_close_device(ctx, dev);
+		tex = gfx_tex_create(size, size, fz_pixmap_samples(ctx, pix), (int)fz_pixmap_stride(ctx, pix));
+	}
+	fz_always(ctx) {
+		fz_drop_device(ctx, dev);
+		fz_drop_path(ctx, disc);
+		fz_drop_path(ctx, dot);
+		fz_drop_path(ctx, arrows);
+		fz_drop_stroke_state(ctx, ss);
+		fz_drop_pixmap(ctx, pix);
+	}
+	fz_catch(ctx)
+		tex = NULL;
+	return tex;
+}
+
 static void ensure_icons(void)
 {
 	int s = (int)lround(20 * ui);
@@ -1834,7 +1898,8 @@ static const char *help_lines[][2] = {
 	{ "D\xc3\xa9""filer", "Molette, fl\xc3\xa8""ches, Espace" },
 	{ "Zoomer / d\xc3\xa9zoomer", "Ctrl+Molette,  +  /  -" },
 	{ "Zoom sur une zone", "Clic droit + glisser" },
-	{ "D\xc3\xa9placer la vue", "Clic gauche (ou milieu) + glisser" },
+	{ "D\xc3\xa9placer la vue", "Clic gauche + glisser" },
+	{ "D\xc3\xa9""filement automatique", "Maintenir le clic molette, viser la direction" },
 	{ "Page enti\xc3\xa8re / pleine largeur", "F (Ctrl+0)  /  L (Ctrl+2)" },
 	{ "Taille r\xc3\xa9""elle (100 %)", "Ctrl+1" },
 	{ "Page pr\xc3\xa9""c\xc3\xa9""dente / suivante", "Pg.Pr\xc3\xa9""c / Pg.Suiv" },
@@ -1889,6 +1954,17 @@ static void draw_overlays(void)
 		draw_text(l1, big, 1, floorf((vw - w) / 2.0f), floorf(vh / 2.0f - big * 1.6f), 0xffe6e8eb);
 		w = text_width(l2, px + 1, 0);
 		draw_text(l2, px + 1, 0, floorf((vw - w) / 2.0f), floorf(vh / 2.0f + px * 0.5f), 0xff9aa0a8);
+	}
+
+	if (drag == DRAG_AUTO) {
+		int s = (int)lround(30 * ui);
+		if (s != icon_auto_size || !icon_auto) {
+			if (icon_auto) gfx_tex_free(icon_auto);
+			icon_auto = make_auto_icon(s);
+			icon_auto_size = s;
+		}
+		if (icon_auto)
+			gfx_image(icon_auto, 0, 0, (float)s, (float)s, mx0 - s / 2.0f, my0 - s / 2.0f, mx0 + s / 2.0f, my0 + s / 2.0f, 0xffffffff);
 	}
 
 	if (drag == DRAG_ZOOM) {
@@ -1967,8 +2043,32 @@ static void draw_overlays(void)
 	if (show_help) draw_help();
 }
 
+/* Défilement automatique (clic molette maintenu) : la vue file dans la direction du
+   curseur par rapport au point de départ, d'autant plus vite qu'il en est loin. */
+static double auto_last;
+
+static int auto_active(void)
+{
+	return drag == DRAG_AUTO && has_doc() && hypot(mx - mx0, my - my0) > 8 * ui;
+}
+
+static void autoscroll_step(void)
+{
+	double t = platform_time(), dt = t - auto_last, dx = mx - mx0, dy = my - my0, d = hypot(dx, dy), e, v;
+	auto_last = t;
+	if (!auto_active()) return;
+	if (dt > 0.05) dt = 0.05;            /* après une pause : pas de saut */
+	e = (d - 8 * ui) / ui;                /* distance utile, en pixels « 96 dpi » */
+	v = (7.0 * e + 0.02 * e * e) * ui;    /* pixels par seconde : 50 px -> ~400 px/s, 200 px -> ~2200 px/s */
+	T->sx += v * dx / d * dt;
+	T->sy += v * dy / d * dt;
+	clamp_scroll();
+	view_dirty = 1;
+}
+
 void core_draw(void)
 {
+	autoscroll_step();
 	if (view_dirty || need_schedule) {
 		view_dirty = need_schedule = 0;
 		schedule();
@@ -1986,7 +2086,7 @@ void core_draw(void)
 
 int core_dirty(void)
 {
-	return dirty || view_dirty || need_schedule;
+	return dirty || view_dirty || need_schedule || auto_active();
 }
 
 int core_timeout_ms(void)
@@ -2386,7 +2486,8 @@ void core_mouse_down(int btn, int x, int y, int mods)
 			return;
 		}
 	}
-	if (btn == BTN_LEFT || btn == BTN_MIDDLE) { drag = DRAG_PAN; drag_btn = btn; mx0 = x; my0 = y; }
+	if (btn == BTN_LEFT) { drag = DRAG_PAN; drag_btn = btn; mx0 = x; my0 = y; }
+	else if (btn == BTN_MIDDLE) { drag = DRAG_AUTO; drag_btn = btn; mx0 = x; my0 = y; auto_last = platform_time(); }
 	else if (btn == BTN_RIGHT) { drag = DRAG_ZOOM; drag_btn = btn; mx0 = x; my0 = y; }
 }
 
@@ -2409,6 +2510,7 @@ void core_mouse_move(int x, int y, int mods)
 		}
 		break;
 	case DRAG_ZOOM:
+	case DRAG_AUTO:
 		dirty = 1;
 		break;
 	case DRAG_VBAR:
@@ -2605,6 +2707,7 @@ int core_input_mode(void) { return input_mode; }
 int core_cursor(void)
 {
 	if (drag == DRAG_PAN) return CUR_HAND;
+	if (drag == DRAG_AUTO) return CUR_AUTO;
 	if (drag == DRAG_ZOOM) return CUR_CROSS;
 	return CUR_ARROW;
 }
@@ -2746,6 +2849,7 @@ void core_shutdown(void)
 		if (texts[i].tex) gfx_tex_free(texts[i].tex);
 	if (icon_rot[0]) gfx_tex_free(icon_rot[0]);
 	if (icon_rot[1]) gfx_tex_free(icon_rot[1]);
+	if (icon_auto) gfx_tex_free(icon_auto);
 	for (i = 0; i < nclosed; i++) free(closed_paths[i]);
 	fz_drop_font(ctx, font_regular);
 	fz_drop_font(ctx, font_bold);

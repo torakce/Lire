@@ -12,7 +12,7 @@ enum {
 	K_TAB, K_F4
 };
 
-enum { CUR_ARROW, CUR_HAND, CUR_CROSS };
+enum { CUR_ARROW, CUR_HAND, CUR_CROSS, CUR_AUTO };
 enum { INPUT_NONE, INPUT_GOTO, INPUT_PASSWORD };
 
 int  core_init(int nthreads);            /* 0 si OK ; nthreads <= 0 : automatique */

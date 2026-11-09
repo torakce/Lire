@@ -217,7 +217,7 @@ static void refresh(void)
 static void update_cursor(void)
 {
 	switch (core_cursor()) {
-	case CUR_HAND: SetCursor(cur_hand); break;
+	case CUR_HAND: case CUR_AUTO: SetCursor(cur_hand); break;
 	case CUR_CROSS: SetCursor(cur_cross); break;
 	default: SetCursor(cur_arrow); break;
 	}
