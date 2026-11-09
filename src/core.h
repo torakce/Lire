@@ -54,6 +54,7 @@ void   core_stats(char *buf, int len);
 void   platform_wake(void);                  /* appelable depuis n'importe quel thread */
 void   platform_set_title(const char *utf8);
 void   platform_open_dialog(void);
+void   platform_open_with(const char *utf8_path, int right_x, int top_y);   /* menu « Ouvrir avec » sous le bouton */
 void   platform_toggle_fullscreen(void);
 void   platform_quit(void);
 void   platform_wheel_mode_changed(int zoom);

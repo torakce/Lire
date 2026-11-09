@@ -21,6 +21,7 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 | Onglet suivant / précédent | `Ctrl+Tab` / `Ctrl+Maj+Tab` (ou `Ctrl+Pg.Suiv` / `Ctrl+Pg.Préc`) |
 | Fermer l'onglet | `Ctrl+W`, clic sur `×` ou clic molette sur l'onglet |
 | Rouvrir le dernier onglet fermé | `Ctrl+Maj+T` |
+| Ouvrir le fichier avec un autre logiciel (Acrobat, Annoter…) | Bouton en haut à droite ou `Ctrl+Maj+O` |
 | Défiler | Molette, flèches, Espace / Maj+Espace |
 | Zoomer / dézoomer (autour du curseur) | Ctrl+Molette, `+` / `-` |
 | Zoom sur une zone | Clic droit + glisser un rectangle |
@@ -36,6 +37,10 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 | Recharger le fichier (après un nouvel export) | `F5` |
 | Plein écran | `F11` |
 | Aide | `F1` ou `H` |
+
+« Ouvrir avec » propose les logiciels que Windows recommande pour les PDF, puis ceux déjà choisis via
+« Choisir un programme… » (pratique pour un logiciel portable comme Annoter, que Windows ne connaît pas) ;
+« Autres applications (Windows)… » ouvre la fenêtre standard, sans jamais changer le logiciel par défaut.
 
 La barre de défilement de droite est saisissable ; en la faisant glisser, le numéro de page s'affiche.
 La rotation s'applique à tout le document de l'onglet ; l'angle courant est rappelé dans la barre d'état.

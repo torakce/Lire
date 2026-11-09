@@ -5,11 +5,18 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <objbase.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #include <GL/gl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +41,8 @@ static WINDOWPLACEMENT saved_wp;
 static int buttons;
 static HCURSOR cur_arrow, cur_hand, cur_cross;
 static int tracking;
+static HICON menu_icons[64];   /* icônes du menu « Ouvrir avec » (par identifiant de commande) */
+static int menu_icon_px = 16;
 
 #define LIRE_COPYDATA 0x4C495245   /* 'LIRE' */
 
@@ -121,6 +130,295 @@ void platform_open_dialog(void)
 			}
 		}
 	}
+}
+
+
+/* ---------- « Ouvrir avec » : le même fichier dans un autre logiciel ---------- */
+
+/* Menu proposé : les logiciels que Windows recommande pour les PDF (Acrobat, Edge,
+   Foxit…), puis ceux choisis à la main dans Lire (logiciels portables comme Annoter,
+   mémorisés dans HKCU\Software\Lire\OuvrirAvec), puis « Choisir un programme… » et
+   la fenêtre « Ouvrir avec » de Windows. */
+
+#define OW_MAX_HANDLERS 24
+#define OW_MAX_MRU 8
+#define OW_ID_HANDLER 100
+#define OW_ID_MRU 200
+#define OW_ID_BROWSE 300
+#define OW_ID_WINDOWS 301
+
+static const GUID lire_IID_IShellItem = { 0x43826d1e, 0xe718, 0x42ee, { 0xbc, 0x55, 0xa1, 0xe2, 0x61, 0xc3, 0x7b, 0xfe } };
+static const GUID lire_IID_IDataObject = { 0x0000010e, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+static const GUID lire_BHID_DataObject = { 0xb8c0bd9f, 0xed24, 0x455c, { 0x83, 0xe6, 0xd5, 0x39, 0x0c, 0x4f, 0xe8, 0xc4 } };
+
+typedef HRESULT (WINAPI *EnumHandlersFn)(PCWSTR, ASSOC_FILTER, IEnumAssocHandlers **);
+typedef HRESULT (WINAPI *ItemFromPathFn)(PCWSTR, IBindCtx *, REFIID, void **);
+typedef HRESULT (WINAPI *OpenWithDlgFn)(HWND, const OPENASINFO *);
+
+static FARPROC shell_fn(const char *name)
+{
+	HMODULE m = GetModuleHandleW(L"shell32.dll");
+	if (!m) m = LoadLibraryW(L"shell32.dll");
+	return m ? GetProcAddress(m, name) : NULL;
+}
+
+static int same_file_w(const wchar_t *a, const wchar_t *b)
+{
+	return a && b && CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL;
+}
+
+/* nom lisible d'un programme : description de l'exe (« Adobe Acrobat »), sinon son nom de fichier */
+static void program_name(const wchar_t *exe, wchar_t *out, int cap)
+{
+	DWORD h = 0, sz = GetFileVersionInfoSizeW(exe, &h);
+	const wchar_t *base = wcsrchr(exe, L'\\');
+	out[0] = 0;
+	if (sz > 0) {
+		void *buf = malloc(sz);
+		struct { WORD lang, cp; } *tr;
+		UINT n = 0;
+		if (buf && GetFileVersionInfoW(exe, 0, sz, buf) &&
+				VerQueryValueW(buf, L"\\VarFileInfo\\Translation", (void **)&tr, &n) && n >= 4) {
+			static const wchar_t *keys[] = { L"FileDescription", L"ProductName" };
+			int k;
+			for (k = 0; k < 2 && !out[0]; k++) {
+				wchar_t q[128], *v = NULL;
+				UINT vn = 0;
+				_snwprintf(q, 128, L"\\StringFileInfo\\%04x%04x\\%ls", tr->lang, tr->cp, keys[k]);
+				q[127] = 0;
+				if (VerQueryValueW(buf, q, (void **)&v, &vn) && v && vn > 1 && v[0]) {
+					wcsncpy(out, v, cap - 1);
+					out[cap - 1] = 0;
+				}
+			}
+		}
+		free(buf);
+	}
+	if (!out[0]) {
+		wchar_t *dot;
+		wcsncpy(out, base ? base + 1 : exe, cap - 1);
+		out[cap - 1] = 0;
+		dot = wcsrchr(out, L'.');
+		if (dot) *dot = 0;
+	}
+}
+
+static HICON small_icon(const wchar_t *file, int index)
+{
+	HICON big = NULL, small = NULL;
+	if (!file || !file[0]) return NULL;
+	if (menu_icon_px > 20) {
+		/* écran haute densité : on prend la grande icône, réduite au dessin */
+		if (ExtractIconExW(file, index, &big, NULL, 1) > 0 && big) return big;
+	}
+	if (ExtractIconExW(file, index, NULL, &small, 1) > 0 && small) return small;
+	if (ExtractIconExW(file, index, &big, NULL, 1) > 0) return big;
+	return NULL;
+}
+
+static int mru_load(wchar_t mru[OW_MAX_MRU][MAX_PATH])
+{
+	HKEY k;
+	wchar_t buf[OW_MAX_MRU * MAX_PATH + 2];
+	DWORD sz = sizeof buf - 2 * sizeof(wchar_t), type = 0;
+	int n = 0;
+	const wchar_t *p;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Lire\\OuvrirAvec", 0, KEY_READ, &k) != ERROR_SUCCESS) return 0;
+	memset(buf, 0, sizeof buf);
+	if (RegQueryValueExW(k, L"Programmes", NULL, &type, (BYTE *)buf, &sz) == ERROR_SUCCESS && type == REG_MULTI_SZ)
+		for (p = buf; *p && n < OW_MAX_MRU; p += wcslen(p) + 1)
+			if (wcslen(p) < MAX_PATH) wcscpy(mru[n++], p);
+	RegCloseKey(k);
+	return n;
+}
+
+/* met exe en tête de la liste des programmes mémorisés */
+static void mru_push(const wchar_t *exe)
+{
+	wchar_t mru[OW_MAX_MRU][MAX_PATH], buf[OW_MAX_MRU * MAX_PATH + 2];
+	int n = mru_load(mru), i, m = 0;
+	size_t pos = 0;
+	HKEY k;
+	if (wcslen(exe) >= MAX_PATH) return;
+	wcscpy(buf, exe);
+	pos = wcslen(exe) + 1;
+	for (i = 0; i < n && m < OW_MAX_MRU - 1; i++) {
+		if (same_file_w(mru[i], exe)) continue;
+		wcscpy(buf + pos, mru[i]);
+		pos += wcslen(mru[i]) + 1;
+		m++;
+	}
+	buf[pos++] = 0;
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Lire\\OuvrirAvec", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) return;
+	RegSetValueExW(k, L"Programmes", 0, REG_MULTI_SZ, (const BYTE *)buf, (DWORD)(pos * sizeof(wchar_t)));
+	RegCloseKey(k);
+}
+
+static int launch_exe(const wchar_t *exe, const wchar_t *file)
+{
+	wchar_t *args = malloc((wcslen(file) + 3) * sizeof *args), dir[MAX_PATH], *slash;
+	INT_PTR r;
+	_snwprintf(args, wcslen(file) + 3, L"\"%ls\"", file);
+	args[wcslen(file) + 2] = 0;
+	wcsncpy(dir, exe, MAX_PATH - 1);
+	dir[MAX_PATH - 1] = 0;
+	slash = wcsrchr(dir, L'\\');
+	if (slash) *slash = 0;
+	r = (INT_PTR)ShellExecuteW(hwnd, NULL, exe, args, slash ? dir : NULL, SW_SHOWNORMAL);
+	free(args);
+	return r > 32;
+}
+
+static int invoke_handler(IAssocHandler *h, const wchar_t *file)
+{
+	ItemFromPathFn from_path = (ItemFromPathFn)(void *)shell_fn("SHCreateItemFromParsingName");
+	IShellItem *item = NULL;
+	IDataObject *data = NULL;
+	HRESULT hr = E_FAIL;
+	if (from_path && SUCCEEDED(from_path(file, NULL, &lire_IID_IShellItem, (void **)&item))) {
+		if (SUCCEEDED(IShellItem_BindToHandler(item, NULL, &lire_BHID_DataObject, &lire_IID_IDataObject, (void **)&data))) {
+			hr = IAssocHandler_Invoke(h, data);
+			IDataObject_Release(data);
+		}
+		IShellItem_Release(item);
+	}
+	if (FAILED(hr)) {   /* repli : lancer directement l'exe du logiciel */
+		LPWSTR exe = NULL;
+		if (SUCCEEDED(IAssocHandler_GetName(h, &exe)) && exe) {
+			int ok = launch_exe(exe, file);
+			CoTaskMemFree(exe);
+			return ok;
+		}
+		return 0;
+	}
+	return 1;
+}
+
+static void browse_program(const wchar_t *file)
+{
+	wchar_t exe[MAX_PATH];
+	OPENFILENAMEW ofn;
+	memset(&ofn, 0, sizeof ofn);
+	exe[0] = 0;
+	ofn.lStructSize = sizeof ofn;
+	ofn.hwndOwner = hwnd;
+	ofn.lpstrFilter = L"Programmes (*.exe)\0*.exe\0";
+	ofn.lpstrFile = exe;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrTitle = L"Choisir le logiciel qui ouvrira ce PDF";
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+	if (GetOpenFileNameW(&ofn) && launch_exe(exe, file)) mru_push(exe);
+}
+
+void platform_open_with(const char *path, int x, int y)
+{
+	EnumHandlersFn enum_handlers = (EnumHandlersFn)(void *)shell_fn("SHAssocEnumHandlers");
+	OpenWithDlgFn open_with_dlg = (OpenWithDlgFn)(void *)shell_fn("SHOpenWithDialog");
+	IAssocHandler *handlers[OW_MAX_HANDLERS];
+	wchar_t mru[OW_MAX_MRU][MAX_PATH], self[MAX_PATH], *file = to_wide(path);
+	wchar_t handler_exe[OW_MAX_HANDLERS][MAX_PATH];
+	int nh = 0, nm, i, cmd, items = 0;
+	HMENU menu = CreatePopupMenu();
+	POINT pt;
+	UINT dpi = 96;
+	typedef UINT (WINAPI *DpiWinFn)(HWND);
+	DpiWinFn get_dpi = (DpiWinFn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+	if (get_dpi) dpi = get_dpi(hwnd);
+	menu_icon_px = MulDiv(16, (int)dpi, 96);
+	memset(menu_icons, 0, sizeof menu_icons);
+	GetModuleFileNameW(NULL, self, MAX_PATH);
+
+	/* 1) logiciels recommandés par Windows pour les PDF (sauf Lire lui-même) */
+	if (enum_handlers) {
+		IEnumAssocHandlers *e = NULL;
+		if (SUCCEEDED(enum_handlers(L".pdf", ASSOC_FILTER_RECOMMENDED, &e)) && e) {
+			IAssocHandler *h = NULL;
+			ULONG got = 0;
+			while (nh < OW_MAX_HANDLERS && IEnumAssocHandlers_Next(e, 1, &h, &got) == S_OK && got == 1) {
+				LPWSTR exe = NULL, ui = NULL, icon = NULL;
+				int idx = 0;
+				handler_exe[nh][0] = 0;
+				if (SUCCEEDED(IAssocHandler_GetName(h, &exe)) && exe) {
+					wcsncpy(handler_exe[nh], exe, MAX_PATH - 1);
+					handler_exe[nh][MAX_PATH - 1] = 0;
+					CoTaskMemFree(exe);
+				}
+				if (same_file_w(handler_exe[nh], self) || FAILED(IAssocHandler_GetUIName(h, &ui)) || !ui) {
+					IAssocHandler_Release(h);
+					continue;
+				}
+				AppendMenuW(menu, MF_STRING, OW_ID_HANDLER + nh, ui);
+				CoTaskMemFree(ui);
+				if (SUCCEEDED(IAssocHandler_GetIconLocation(h, &icon, &idx)) && icon) {
+					menu_icons[nh] = small_icon(icon, idx);
+					CoTaskMemFree(icon);
+				}
+				handlers[nh++] = h;
+				items++;
+			}
+			IEnumAssocHandlers_Release(e);
+		}
+	}
+
+	/* 2) logiciels choisis à la main auparavant (s'ils existent encore et ne sont pas déjà listés) */
+	nm = mru_load(mru);
+	{
+		int sep = 0;
+		for (i = 0; i < nm; i++) {
+			wchar_t name[256];
+			int k, dup = same_file_w(mru[i], self);
+			for (k = 0; k < nh && !dup; k++) dup = same_file_w(mru[i], handler_exe[k]);
+			if (dup || GetFileAttributesW(mru[i]) == INVALID_FILE_ATTRIBUTES) continue;
+			if (items && !sep) { AppendMenuW(menu, MF_SEPARATOR, 0, NULL); sep = 1; }
+			program_name(mru[i], name, 256);
+			AppendMenuW(menu, MF_STRING, OW_ID_MRU + i, name);
+			menu_icons[OW_MAX_HANDLERS + i] = small_icon(mru[i], 0);
+			items++;
+		}
+	}
+
+	/* 3) choix libre */
+	if (items) AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(menu, MF_STRING, OW_ID_BROWSE, L"Choisir un programme…");
+	if (open_with_dlg) AppendMenuW(menu, MF_STRING, OW_ID_WINDOWS, L"Autres applications (Windows)…");
+
+	/* icônes dessinées à la demande (WM_MEASUREITEM / WM_DRAWITEM) */
+	for (i = 0; i < nh + OW_MAX_MRU; i++) {
+		int id = i < nh ? OW_ID_HANDLER + i : OW_ID_MRU + (i - nh);
+		HICON ic = i < nh ? menu_icons[i] : menu_icons[OW_MAX_HANDLERS + (i - nh)];
+		if (ic) {
+			MENUITEMINFOW mi;
+			memset(&mi, 0, sizeof mi);
+			mi.cbSize = sizeof mi;
+			mi.fMask = MIIM_BITMAP | MIIM_DATA;
+			mi.hbmpItem = HBMMENU_CALLBACK;
+			mi.dwItemData = (ULONG_PTR)ic;
+			SetMenuItemInfoW(menu, id, FALSE, &mi);
+		}
+	}
+
+	pt.x = x;
+	pt.y = y;
+	ClientToScreen(hwnd, &pt);
+	cmd = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, NULL);
+
+	if (cmd >= OW_ID_HANDLER && cmd < OW_ID_HANDLER + nh) invoke_handler(handlers[cmd - OW_ID_HANDLER], file);
+	else if (cmd >= OW_ID_MRU && cmd < OW_ID_MRU + nm) {
+		if (launch_exe(mru[cmd - OW_ID_MRU], file)) mru_push(mru[cmd - OW_ID_MRU]);
+	} else if (cmd == OW_ID_BROWSE) browse_program(file);
+	else if (cmd == OW_ID_WINDOWS && open_with_dlg) {
+		OPENASINFO oi;
+		memset(&oi, 0, sizeof oi);
+		oi.pcszFile = file;
+		oi.oaifInFlags = OAIF_EXEC | OAIF_HIDE_REGISTRATION;   /* ne change jamais l'application par défaut */
+		open_with_dlg(hwnd, &oi);
+	}
+
+	for (i = 0; i < nh; i++) IAssocHandler_Release(handlers[i]);
+	for (i = 0; i < (int)(sizeof menu_icons / sizeof menu_icons[0]); i++)
+		if (menu_icons[i]) { DestroyIcon(menu_icons[i]); menu_icons[i] = NULL; }
+	DestroyMenu(menu);
+	free(file);
 }
 
 void platform_toggle_fullscreen(void)
@@ -435,6 +733,27 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 		return TRUE;
 	}
 
+	case WM_MEASUREITEM: {
+		MEASUREITEMSTRUCT *mis = (MEASUREITEMSTRUCT *)lp;
+		if (mis && mis->CtlType == ODT_MENU) {
+			mis->itemWidth = menu_icon_px;
+			mis->itemHeight = menu_icon_px;
+			return TRUE;
+		}
+		break;
+	}
+
+	case WM_DRAWITEM: {
+		DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
+		if (dis && dis->CtlType == ODT_MENU && dis->itemData) {
+			int hgt = dis->rcItem.bottom - dis->rcItem.top;
+			DrawIconEx(dis->hDC, dis->rcItem.left, dis->rcItem.top + (hgt - menu_icon_px) / 2,
+					(HICON)dis->itemData, menu_icon_px, menu_icon_px, 0, NULL, DI_NORMAL);
+			return TRUE;
+		}
+		break;
+	}
+
 	case WM_CLOSE:
 		save_settings();
 		ShowWindow(h, SW_HIDE);   /* la fenêtre disparaît immédiatement */
@@ -470,6 +789,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
 	if (!set_ctx || !set_ctx((HANDLE)(intptr_t)-4 /* PER_MONITOR_AWARE_V2 */))
 		SetProcessDPIAware();
 	QueryPerformanceFrequency(&qpf);
+	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);   /* « Ouvrir avec » (shell) */
 
 	/* Instance unique : si Lire est déjà ouvert, on lui confie les fichiers (nouveaux onglets).
 	   Le verrou évite d'ouvrir plusieurs fenêtres quand l'Explorateur lance plusieurs fichiers d'un coup. */

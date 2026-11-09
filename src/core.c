@@ -53,7 +53,7 @@ enum { L_NONE, L_QUEUED, L_BUILDING, L_READY, L_ERROR };
 enum { J_IDLE, J_QUEUED, J_RUNNING, J_DONE, J_READY, J_FAILED };
 enum { FIT_NONE, FIT_PAGE, FIT_WIDTH };
 enum { DRAG_NONE, DRAG_PAN, DRAG_ZOOM, DRAG_VBAR, DRAG_HBAR, DRAG_AUTO };
-enum { HIT_NONE = 0, HIT_PLUS, HIT_ROT_CCW, HIT_ROT_CW, HIT_TAB = 100000, HIT_CLOSE = 200000 };
+enum { HIT_NONE = 0, HIT_PLUS, HIT_OPENWITH, HIT_ROT_CCW, HIT_ROT_CW, HIT_TAB = 100000, HIT_CLOSE = 200000 };
 
 typedef struct Job Job;
 typedef struct Tab Tab;
@@ -1592,20 +1592,70 @@ static void *make_auto_icon(int size)
 	return tex;
 }
 
+/* icône « ouvrir avec un autre logiciel » : fenêtre ouverte en haut à droite, flèche qui en sort */
+static void *icon_open;
+
+static void *make_open_icon(int size)
+{
+	fz_pixmap *pix = NULL;
+	fz_device *dev = NULL;
+	fz_path *path = NULL;
+	fz_stroke_state *ss = NULL;
+	void *tex = NULL;
+	fz_var(pix); fz_var(dev); fz_var(path); fz_var(ss);
+	fz_try(ctx) {
+		float s = (float)size, white[3] = { 1, 1, 1 };
+		pix = fz_new_pixmap(ctx, fz_device_bgr(ctx), size, size, NULL, 1);
+		fz_clear_pixmap(ctx, pix);
+		path = fz_new_path(ctx);
+		/* cadre ouvert sur le coin haut droit */
+		fz_moveto(ctx, path, s * 0.46f, s * 0.20f);
+		fz_lineto(ctx, path, s * 0.20f, s * 0.20f);
+		fz_lineto(ctx, path, s * 0.20f, s * 0.80f);
+		fz_lineto(ctx, path, s * 0.80f, s * 0.80f);
+		fz_lineto(ctx, path, s * 0.80f, s * 0.54f);
+		/* flèche vers le haut à droite */
+		fz_moveto(ctx, path, s * 0.47f, s * 0.53f);
+		fz_lineto(ctx, path, s * 0.84f, s * 0.16f);
+		fz_moveto(ctx, path, s * 0.58f, s * 0.16f);
+		fz_lineto(ctx, path, s * 0.84f, s * 0.16f);
+		fz_lineto(ctx, path, s * 0.84f, s * 0.42f);
+		ss = fz_new_stroke_state(ctx);
+		ss->linewidth = s * 0.09f;
+		ss->start_cap = ss->end_cap = FZ_LINECAP_ROUND;
+		ss->linejoin = FZ_LINEJOIN_ROUND;
+		dev = fz_new_draw_device(ctx, fz_identity, pix);
+		fz_stroke_path(ctx, dev, path, ss, fz_identity, fz_device_bgr(ctx), white, 1, fz_default_color_params);
+		fz_close_device(ctx, dev);
+		tex = gfx_tex_create(size, size, fz_pixmap_samples(ctx, pix), (int)fz_pixmap_stride(ctx, pix));
+	}
+	fz_always(ctx) {
+		fz_drop_device(ctx, dev);
+		fz_drop_path(ctx, path);
+		fz_drop_stroke_state(ctx, ss);
+		fz_drop_pixmap(ctx, pix);
+	}
+	fz_catch(ctx)
+		tex = NULL;
+	return tex;
+}
+
 static void ensure_icons(void)
 {
 	int s = (int)lround(20 * ui);
 	if (s == icon_size && icon_rot[0]) return;
 	if (icon_rot[0]) gfx_tex_free(icon_rot[0]);
 	if (icon_rot[1]) gfx_tex_free(icon_rot[1]);
+	if (icon_open) gfx_tex_free(icon_open);
 	icon_rot[0] = make_rot_icon(s, 0);
 	icon_rot[1] = make_rot_icon(s, 1);
+	icon_open = make_open_icon((int)lround(18 * ui));
 	icon_size = icon_w = s;
 }
 
 /* ---------- barre d'onglets ---------- */
 
-typedef struct { float x0, tab_w, avail_x1, plus_x0, plus_x1, ccw_x0, cw_x0, btn_w, top; } BarLayout;
+typedef struct { float x0, tab_w, avail_x1, plus_x0, plus_x1, ow_x0, ccw_x0, cw_x0, btn_w, top; } BarLayout;
 
 static void bar_layout(BarLayout *L)
 {
@@ -1614,8 +1664,9 @@ static void bar_layout(BarLayout *L)
 	L->btn_w = (float)bar_h;
 	L->cw_x0 = win_w - pad - L->btn_w;
 	L->ccw_x0 = L->cw_x0 - L->btn_w;
+	L->ow_x0 = L->ccw_x0 - L->btn_w - 6 * ui;
 	L->x0 = pad;
-	L->avail_x1 = L->ccw_x0 - pad - plus_w;
+	L->avail_x1 = L->ow_x0 - pad - plus_w;
 	avail = fmaxf(L->avail_x1 - L->x0, 1);
 	L->tab_w = ntabs ? floorf(fminf(fmaxf(avail / ntabs, 90 * ui), 240 * ui)) : 0;
 	total = ntabs * L->tab_w;
@@ -1649,6 +1700,7 @@ static int bar_hit(int x, int y)
 	bar_layout(&L);
 	if (x >= L.cw_x0 && x < L.cw_x0 + L.btn_w) return HIT_ROT_CW;
 	if (x >= L.ccw_x0 && x < L.ccw_x0 + L.btn_w) return HIT_ROT_CCW;
+	if (x >= L.ow_x0 && x < L.ow_x0 + L.btn_w) return HIT_OPENWITH;
 	if (x >= L.plus_x0 && x < L.plus_x1) return HIT_PLUS;
 	if (x >= L.avail_x1 || y < L.top) return HIT_NONE;
 	for (i = 0; i < ntabs; i++) {
@@ -1727,8 +1779,21 @@ static void draw_tabbar(void)
 		if (hover == HIT_PLUS) gfx_rect(L.plus_x0, b0, L.plus_x1, b1, 0xff3a3d42);
 		draw_text("+", pp, 0, floorf((L.plus_x0 + L.plus_x1 - pt->w) / 2), floorf((b0 + b1 - pt->h) / 2), 0xffc8ccd2);
 	}
-	/* boutons de rotation */
+	/* bouton « ouvrir avec » */
 	ensure_icons();
+	{
+		float b0 = 4 * ui, b1 = bar_h - 4 * ui;
+		int on = T && T->path && T->doc;
+		unsigned col = on ? (hover == HIT_OPENWITH ? 0xffffffff : 0xffc8ccd2) : 0x60c8ccd2;
+		if (hover == HIT_OPENWITH && on) gfx_rect(L.ow_x0 + 2 * ui, b0, L.ow_x0 + L.btn_w - 2 * ui, b1, 0xff3a3d42);
+		gfx_rect(L.ow_x0 + L.btn_w + 2 * ui, 9 * ui, L.ow_x0 + L.btn_w + 3 * ui, bar_h - 9 * ui, 0xff3a3d42);   /* séparateur */
+		if (icon_open) {
+			int iw = (int)lround(18 * ui);
+			float ix = floorf(L.ow_x0 + (L.btn_w - iw) / 2), iy = floorf((bar_h - iw) / 2.0f);
+			gfx_image(icon_open, 0, 0, (float)iw, (float)iw, ix, iy, ix + iw, iy + iw, col);
+		}
+	}
+	/* boutons de rotation */
 	for (i = 0; i < 2; i++) {
 		float bx = i == 0 ? L.ccw_x0 : L.cw_x0, b0 = 4 * ui, b1 = bar_h - 4 * ui;
 		int h = i == 0 ? HIT_ROT_CCW : HIT_ROT_CW;
@@ -1753,6 +1818,7 @@ static void draw_tooltip(void)
 	bar_layout(&L);
 	switch (hover) {
 	case HIT_PLUS: s = "Ouvrir un fichier  (Ctrl+O)"; x = L.plus_x0; break;
+	case HIT_OPENWITH: s = "Ouvrir avec un autre logiciel  (Ctrl+Maj+O)"; x = L.ow_x0; break;
 	case HIT_ROT_CCW: s = "Rotation antihoraire  (Maj+R)"; x = L.ccw_x0; break;
 	case HIT_ROT_CW: s = "Rotation horaire  (R)"; x = L.cw_x0; break;
 	default:
@@ -1895,6 +1961,7 @@ static const char *help_lines[][2] = {
 	{ "Onglet suivant / pr\xc3\xa9""c\xc3\xa9""dent", "Ctrl+Tab / Ctrl+Maj+Tab" },
 	{ "Fermer l'onglet", "Ctrl+W  ou clic molette sur l'onglet" },
 	{ "Rouvrir l'onglet ferm\xc3\xa9", "Ctrl+Maj+T" },
+	{ "Ouvrir avec un autre logiciel", "Ctrl+Maj+O  ou bouton en haut \xc3\xa0 droite" },
 	{ "D\xc3\xa9""filer", "Molette, fl\xc3\xa8""ches, Espace" },
 	{ "Zoomer / d\xc3\xa9zoomer", "Ctrl+Molette,  +  /  -" },
 	{ "Zoom sur une zone", "Clic droit + glisser" },
@@ -2421,6 +2488,18 @@ static void rotate(int delta)
 	view_dirty = dirty = 1;
 }
 
+/* « Ouvrir avec » : menu des autres logiciels sous le bouton de la barre */
+static void open_with(void)
+{
+	BarLayout L;
+	if (!T || !T->path || !T->doc) return;
+	bar_layout(&L);
+	hover = HIT_NONE;
+	drag = DRAG_NONE;
+	platform_open_with(T->path, (int)(L.ow_x0 + L.btn_w), bar_h);
+	dirty = 1;
+}
+
 void core_set_wheel_zoom(int on) { wheel_zoom = on; }
 int core_wheel_zoom(void) { return wheel_zoom; }
 
@@ -2461,6 +2540,7 @@ void core_mouse_down(int btn, int x, int y, int mods)
 			if (h >= HIT_CLOSE) close_tab(h - HIT_CLOSE);
 			else if (h >= HIT_TAB) activate(h - HIT_TAB);
 			else if (h == HIT_PLUS) platform_open_dialog();
+			else if (h == HIT_OPENWITH) open_with();
 			else if (h == HIT_ROT_CCW) rotate(-90);
 			else if (h == HIT_ROT_CW) rotate(90);
 		}
@@ -2590,7 +2670,7 @@ void core_key(int key, int mods)
 		case K_PGUP: next_tab(-1); return;
 		case 'W': case K_F4: if (T) close_tab(active); return;
 		case 'T': if (shift) reopen_closed(); else platform_open_dialog(); return;
-		case 'O': platform_open_dialog(); return;
+		case 'O': if (shift) open_with(); else platform_open_dialog(); return;
 		case 'Q': platform_quit(); return;
 		}
 	}
@@ -2850,6 +2930,7 @@ void core_shutdown(void)
 	if (icon_rot[0]) gfx_tex_free(icon_rot[0]);
 	if (icon_rot[1]) gfx_tex_free(icon_rot[1]);
 	if (icon_auto) gfx_tex_free(icon_auto);
+	if (icon_open) gfx_tex_free(icon_open);
 	for (i = 0; i < nclosed; i++) free(closed_paths[i]);
 	fz_drop_font(ctx, font_regular);
 	fz_drop_font(ctx, font_bold);

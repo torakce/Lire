@@ -27,6 +27,7 @@ void platform_wake(void)
 }
 void platform_set_title(const char *s) { printf("  [titre] %s\n", s); }
 void platform_open_dialog(void) {}
+void platform_open_with(const char *p, int x, int y) { printf("  [ouvrir avec] %s (bouton %d,%d)\n", p, x, y); }
 void platform_toggle_fullscreen(void) {}
 void platform_quit(void) {}
 void platform_wheel_mode_changed(int z) { (void)z; }

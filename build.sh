@@ -41,6 +41,6 @@ $CROSS-gcc -O2 -Wall -municode -mwindows -static -s \
 	-I"$MUPDF/include" \
 	"$HERE/src/core.c" "$HERE/src/gfx_gl.c" "$HERE/src/win32.c" "$OUT/lire_res.o" \
 	"$LIBDIR/libmupdf.a" "$LIBDIR/libmupdf-third.a" \
-	-lopengl32 -lgdi32 -lcomdlg32 -lshell32 -ladvapi32 -luser32 -lm \
+	-lopengl32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -lversion -ladvapi32 -luser32 -lm \
 	-o "$OUT/Lire.exe"
 ls -la "$OUT/Lire.exe"
