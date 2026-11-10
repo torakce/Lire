@@ -9,11 +9,11 @@ enum { LMOD_CTRL = 1, LMOD_SHIFT = 2, LMOD_ALT = 4 };
 enum {
 	K_PGUP = 256, K_PGDN, K_HOME, K_END, K_UP, K_DOWN, K_LEFT, K_RIGHT,
 	K_SPACE, K_ENTER, K_ESC, K_BACKSPACE, K_F1, K_F5, K_F11, K_PLUS, K_MINUS,
-	K_TAB, K_F4
+	K_TAB, K_F4, K_F3
 };
 
 enum { CUR_ARROW, CUR_HAND, CUR_CROSS, CUR_AUTO, CUR_TEXT };
-enum { INPUT_NONE, INPUT_GOTO, INPUT_PASSWORD };
+enum { INPUT_NONE, INPUT_GOTO, INPUT_PASSWORD, INPUT_FIND };
 
 int  core_init(int nthreads);            /* 0 si OK ; nthreads <= 0 : automatique */
 void core_shutdown(void);
@@ -56,6 +56,7 @@ double core_zoom_percent(void);
 int    core_tab_count(void);
 int    core_active_tab(void);
 void   core_stats(char *buf, int len);
+void   core_find_info(int *total, int *rank, int *pending, int *page);   /* recherche (tests) */
 
 /* Fonctions à fournir par la plateforme */
 void   platform_wake(void);                  /* appelable depuis n'importe quel thread */
@@ -64,6 +65,7 @@ void   platform_open_dialog(void);
 /* menu déroulant sous un bouton de la barre ; rend l'indice choisi ou -1 (libellés UTF-8, « \t » avant le raccourci) */
 int    platform_popup_menu(const char *const *labels, const int *flags, int n, int right_x, int top_y);
 void   platform_set_clipboard(const char *utf8);
+char  *platform_get_clipboard(void);        /* texte UTF-8 (à libérer avec free), NULL si vide */
 void   platform_open_with(const char *utf8_path, int right_x, int top_y);   /* menu « Ouvrir avec » sous le bouton */
 void   platform_toggle_fullscreen(void);
 void   platform_quit(void);

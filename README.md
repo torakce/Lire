@@ -28,6 +28,7 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 | Déplacer la vue | Clic gauche + glisser (hors du texte) |
 | Sélectionner du texte | Clic gauche + glisser **sur** le texte (comme Acrobat) ; double-clic : un mot ; `Maj`+clic : étendre |
 | Copier le texte sélectionné / tout le texte de la page | `Ctrl+C` / `Ctrl+A` puis `Ctrl+C` |
+| Rechercher du texte dans tout le document | `Ctrl+F`, taper (ou coller avec `Ctrl+V`) ; `Entrée` / `Maj+Entrée` : résultat suivant / précédent (aussi `F3` / `Maj+F3` ou les flèches de la barre) ; `Échap` : fermer |
 | Défilement automatique | Maintenir le clic molette : la vue file dans la direction du curseur, d'autant plus vite qu'il est loin du point de départ ; elle s'arrête au relâchement |
 | Page entière / pleine largeur | `F` ou `Ctrl+0` / `L` ou `Ctrl+2` |
 | Taille réelle (100 %) | `Ctrl+1` |
@@ -55,6 +56,15 @@ séparée** (la première page reste seule, à droite, puis 2–3, 4–5…) ; *
 Sélection de texte : le curseur devient une barre verticale au-dessus d'un texte. Le texte de chaque page affichée est
 extrait en tâche de fond depuis sa display list (quelques dizaines de ms, sans effet sur l'affichage). Si un plan
 a été exporté avec les textes « vectorisés » (transformés en traits), il n'y a pas de texte à sélectionner.
+
+Recherche (`Ctrl+F`) : la barre s'ouvre en haut à droite et la recherche se fait **pendant la frappe**, dans tout le
+document, en partant de la page affichée. Elle ignore majuscules et accents (« tolerance » trouve « Tolérance »).
+Tous les résultats sont surlignés en jaune, le résultat courant en orange, avec le compteur « 3 / 57 ».
+Sur un plan affiché en entier, où le texte est illisible, Lire zoome juste ce qu'il faut pour lire le résultat
+(et l'encadre) ; sinon le zoom ne change pas. Zoom, rotation, défilement et souris restent utilisables barre ouverte.
+La recherche est linéaire (une page A0 chargée de cotes est parcourue en ~10 ms) et faite par tranches entre deux
+images : l'interface reste fluide, même sur un document de plusieurs centaines de pages. Comme pour la sélection,
+un texte « vectorisé » à l'export n'est pas cherchable.
 
 La barre de défilement de droite est saisissable ; en la faisant glisser, le numéro de page s'affiche.
 La rotation s'applique à tout le document de l'onglet ; l'angle courant est rappelé dans la barre d'état.

@@ -27,6 +27,7 @@
 #include "thread.h"
 
 #include <mupdf/fitz.h>
+#include <mupdf/ucdn.h>
 #include <mupdf/pdf.h>
 
 #include <ctype.h>
@@ -93,6 +94,11 @@ typedef struct {
 	fz_stext_page *stext;   /* texte de la page (sélection), extrait à la demande depuis la display list */
 	int sstate;
 	int row;                /* rangée (une page, ou deux côte à côte) */
+	size_t sbytes;          /* mémoire du texte extrait */
+	fz_quad *fq;            /* résultats de la recherche (Ctrl+F) sur cette page */
+	int *fmark;             /* numéro du résultat de chaque quadrilatère */
+	int nfq, nfhits;
+	unsigned fgen;          /* génération de recherche à laquelle correspondent ces résultats */
 	Job *ready;
 } Page;
 
@@ -500,12 +506,16 @@ static fz_document *open_extra(fz_context *c, const char *path, const char *pw, 
 	return d;
 }
 
-/* (sous mu) page dont le texte est à extraire (pages visibles seulement), -1 sinon */
+static int stext_from;   /* (sous mu) l'extraction du texte part de cette page (recherche) */
+
+/* (sous mu) page dont le texte est à extraire (pages visibles, ou toutes pendant une recherche), -1 sinon */
 static int queued_stext(Tab *t)
 {
-	int k;
-	for (k = 0; k < t->npages; k++)
-		if (t->pages[k].sstate == L_QUEUED) return k;
+	int k, i;
+	for (k = 0; k < t->npages; k++) {
+		i = (stext_from + k) % t->npages;
+		if (i >= 0 && t->pages[i].sstate == L_QUEUED) return i;
+	}
 	return -1;
 }
 
@@ -545,6 +555,7 @@ static void build_stext(int k, fz_context *c, Tab *t, int i)
 	loader_tab[k] = NULL;
 	if (p->sstate == L_BUILDING) {
 		p->stext = sp;
+		p->sbytes = sp ? fz_pool_size(c, sp->pool) : 0;
 		p->sstate = sp ? L_READY : L_ERROR;
 	} else {
 		fz_drop_stext_page(c, sp);   /* annulé entre-temps */
@@ -796,6 +807,8 @@ static void tab_clear(Tab *t)
 	for (i = 0; i < t->npages; i++) {
 		fz_drop_display_list(ctx, t->pages[i].list);
 		fz_drop_stext_page(ctx, t->pages[i].stext);
+		free(t->pages[i].fq);
+		free(t->pages[i].fmark);
 	}
 	free(t->pages);
 	t->pages = NULL;
@@ -1300,6 +1313,379 @@ static void select_all(void)
 	if (nselq == 0) set_toast("Aucun texte s\xc3\xa9lectionnable sur cette page");
 }
 
+/* ---------- recherche de texte (Ctrl+F) ---------- */
+
+/* La recherche porte sur tout le document : le texte de chaque page est extrait en
+   tâche de fond (depuis sa display list) et cherché sur le thread principal, quelques
+   pages par image pour rester fluide. Insensible à la casse et aux accents. */
+static Tab *find_tab;              /* onglet où des résultats sont affichés */
+static char find_q[256];           /* texte cherché (UTF-8), gardé après fermeture de la barre */
+static unsigned find_gen = 1;
+static int find_page = -1, find_hit = -1;   /* résultat courant */
+static int find_want;              /* +1 / -1 : aller au résultat suivant / précédent dès qu'il est connu */
+static int find_fresh;             /* la prochaine frappe remplace le texte (barre rouverte) */
+static double find_due;            /* frappe en cours : recherche lancée un peu après */
+static int find_more;              /* des pages sont prêtes à être cherchées à l'image suivante */
+static float fbar_x0, fbar_y0, fbar_x1, fbar_y1, fbar_btn, fbtn_x[3];   /* barre de recherche (vue) */
+static int find_hover;             /* bouton survolé : 1 précédent, 2 suivant, 3 fermer */
+
+/* 0 hors de la barre de recherche, 4 dans la barre, 1..3 sur un bouton */
+static int find_bar_hit(int x, int y)
+{
+	int k;
+	if (input_mode != INPUT_FIND || x < fbar_x0 || x >= fbar_x1 || y < fbar_y0 || y >= fbar_y1) return 0;
+	for (k = 0; k < 3; k++)
+		if (x >= fbtn_x[k] && x < fbtn_x[k] + fbar_btn) return k + 1;
+	return 4;
+}
+
+static int auto_active(void);
+
+static int find_active(void) { return find_tab && find_tab == T && find_q[0] && has_doc(); }
+
+static void find_reset_results(Tab *t)
+{
+	int i;
+	if (!t || !t->pages) return;
+	for (i = 0; i < t->npages; i++) {
+		Page *p = &t->pages[i];
+		free(p->fq);
+		free(p->fmark);
+		p->fq = NULL;
+		p->fmark = NULL;
+		p->nfq = p->nfhits = 0;
+		p->fgen = 0;
+	}
+}
+
+/* ferme la recherche (les surlignages disparaissent, le texte cherché est gardé) */
+static void find_close(void)
+{
+	find_reset_results(find_tab);
+	find_tab = NULL;
+	find_page = find_hit = -1;
+	find_want = 0;
+	find_hover = 0;
+	if (input_mode == INPUT_FIND) input_mode = INPUT_NONE;
+	dirty = need_schedule = 1;
+}
+
+/* le texte cherché a changé : on repart de zéro (et l'on ira au premier résultat trouvé) */
+static void find_fold_query(void);
+
+static void find_restart(int delay)
+{
+	find_fold_query();
+	find_gen++;
+	if (find_gen == 0) find_gen = 1;
+	find_tab = T;
+	find_page = find_hit = -1;
+	find_want = 1;
+	find_due = platform_time() + (delay ? 0.18 : 0);
+	dirty = need_schedule = 1;
+}
+
+static void find_open(void)
+{
+	if (!has_doc()) return;
+	clear_selection();
+	input_mode = INPUT_FIND;
+	find_fresh = find_q[0] != 0;
+	if (find_q[0] && !find_active()) find_restart(0);
+	dirty = 1;
+}
+
+/* Recherche linéaire maison : la recherche de MuPDF devient quadratique sur les plans
+   très chargés en cotes (plusieurs secondes pour une page A0). Le texte est replié
+   (minuscules, sans accents, espaces fusionnés), puis parcouru une seule fois. */
+static int fold_char(int c)
+{
+	uint32_t a, b;
+	int k;
+	if (c < 128) return c >= 'A' && c <= 'Z' ? c + 32 : (c == '\t' || c == '\n' || c == '\r') ? ' ' : c;
+	/* é -> e : décomposition canonique quand le reste n'est qu'un accent */
+	for (k = 0; k < 4 && ucdn_decompose((uint32_t)c, &a, &b) && ucdn_get_general_category(b) == UCDN_GENERAL_CATEGORY_MN; k++)
+		c = (int)a;
+	if (c >= 0xff01 && c <= 0xff5e) c -= 0xfee0;    /* ASCII pleine largeur */
+	switch (c) {
+	case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2212: return '-';
+	case 0x2018: case 0x2019: case 0x2032: return '\'';
+	case 0x201c: case 0x201d: return '"';
+	case 0x2300: return 0xf8;                        /* signe diamètre -> ø */
+	}
+	if (ucdn_get_general_category((uint32_t)c) == UCDN_GENERAL_CATEGORY_ZS) return ' ';
+	if (ucdn_get_general_category((uint32_t)c) == UCDN_GENERAL_CATEGORY_MN) return -1;   /* accent isolé : ignoré */
+	return fz_tolower(c);
+}
+
+static int find_needle[256], find_nlen;
+
+static void find_fold_query(void)
+{
+	const char *q = find_q;
+	int c, f;
+	find_nlen = 0;
+	while (*q && find_nlen < (int)(sizeof find_needle / sizeof *find_needle)) {
+		q += fz_chartorune(&c, q);
+		f = fold_char(c);
+		if (f < 0) continue;
+		if (f == ' ' && (find_nlen == 0 || find_needle[find_nlen - 1] == ' ')) continue;
+		find_needle[find_nlen++] = f;
+	}
+	while (find_nlen > 0 && find_needle[find_nlen - 1] == ' ') find_nlen--;
+}
+
+typedef struct { int *c; fz_stext_char **ch; fz_stext_line **ln; int n, cap; } Hay;
+
+static void hay_push(Hay *h, int c, fz_stext_char *ch, fz_stext_line *ln)
+{
+	if (c < 0) return;
+	if (c == ' ' && (h->n == 0 || h->c[h->n - 1] == ' ')) return;
+	if (h->n == h->cap) {
+		h->cap = h->cap ? h->cap * 2 : 4096;
+		h->c = realloc(h->c, h->cap * sizeof *h->c);
+		h->ch = realloc(h->ch, h->cap * sizeof *h->ch);
+		h->ln = realloc(h->ln, h->cap * sizeof *h->ln);
+	}
+	h->c[h->n] = c;
+	h->ch[h->n] = ch;
+	h->ln[h->n] = ln;
+	h->n++;
+}
+
+static void hay_blocks(Hay *h, fz_stext_block *b, int depth)
+{
+	for (; b; b = b->next) {
+		if (b->type == FZ_STEXT_BLOCK_TEXT) {
+			fz_stext_line *ln;
+			for (ln = b->u.t.first_line; ln; ln = ln->next) {
+				fz_stext_char *ch;
+				for (ch = ln->first_char; ch; ch = ch->next)
+					hay_push(h, fold_char(ch->c), ch, ln);
+				hay_push(h, ' ', NULL, NULL);    /* fin de ligne = espace */
+			}
+		} else if (b->type == FZ_STEXT_BLOCK_STRUCT && b->u.s.down && depth < 32) {
+			hay_blocks(h, b->u.s.down->first_block, depth + 1);
+		}
+	}
+}
+
+static void find_search_page(Page *p)
+{
+	static Hay h;
+	int i, k, cap = 0, n = 0, hits = 0, m = find_nlen;
+	fz_quad *q = NULL;
+	int *mk = NULL;
+	free(p->fq);
+	free(p->fmark);
+	p->fq = NULL;
+	p->fmark = NULL;
+	p->nfq = p->nfhits = 0;
+	if (m == 0 || !p->stext) return;
+	h.n = 0;
+	hay_blocks(&h, p->stext->first_block, 0);
+	for (i = 0; i + m <= h.n; i++) {
+		fz_stext_line *cur = NULL;
+		if (h.c[i] != find_needle[0]) continue;
+		for (k = 1; k < m && h.c[i + k] == find_needle[k]; k++) {}
+		if (k < m) continue;
+		/* un quadrilatère par ligne traversée, du premier au dernier caractère */
+		for (k = i; k < i + m; k++) {
+			fz_stext_char *ch = h.ch[k];
+			if (!ch) continue;
+			if (h.ln[k] == cur) {
+				q[n - 1].ur = ch->quad.ur;
+				q[n - 1].lr = ch->quad.lr;
+				continue;
+			}
+			if (n == cap) {
+				cap = cap ? cap * 2 : 64;
+				q = realloc(q, cap * sizeof *q);
+				mk = realloc(mk, cap * sizeof *mk);
+			}
+			q[n] = ch->quad;
+			mk[n] = hits;
+			n++;
+			cur = h.ln[k];
+		}
+		hits++;
+		i += m - 1;   /* résultats sans chevauchement */
+	}
+	if (n == 0) { free(q); free(mk); return; }
+	p->fq = q;
+	p->fmark = mk;
+	p->nfq = n;
+	p->nfhits = hits;
+}
+
+/* rectangle (pixels de la vue) d'un résultat, NULL si inconnu */
+static int find_hit_rect(int page, int hit, float *x0, float *y0, float *x1, float *y1)
+{
+	Tab *t = T;
+	Page *p = &t->pages[page];
+	fz_matrix m = view_ctm(t->rot, t->scale);
+	double X = p->left - floor(t->sx), Y = p->top - floor(t->sy);
+	int k, any = 0;
+	for (k = 0; k < p->nfq; k++) {
+		fz_rect r;
+		if (p->fmark[k] != hit) continue;
+		r = fz_transform_rect(fz_rect_from_quad(p->fq[k]), m);
+		if (!any || r.x0 < *x0) *x0 = r.x0;
+		if (!any || r.y0 < *y0) *y0 = r.y0;
+		if (!any || r.x1 > *x1) *x1 = r.x1;
+		if (!any || r.y1 > *y1) *y1 = r.y1;
+		any = 1;
+	}
+	if (!any) return 0;
+	*x0 += (float)(X - p->pbox.x0); *x1 += (float)(X - p->pbox.x0);
+	*y0 += (float)(Y - p->pbox.y0); *y1 += (float)(Y - p->pbox.y0);
+	return 1;
+}
+
+/* hauteur à l'écran (pixels) du texte d'un résultat */
+static double find_hit_height(int page, int hit)
+{
+	Page *p = &T->pages[page];
+	int k;
+	for (k = 0; k < p->nfq; k++)
+		if (p->fmark[k] == hit) {
+			fz_quad v = fz_transform_quad(p->fq[k], view_ctm(T->rot, T->scale));
+			return hypot(v.ll.x - v.ul.x, v.ll.y - v.ul.y);
+		}
+	return 0;
+}
+
+/* Amène le résultat courant à l'écran, s'il n'y est pas déjà. Le zoom ne change que si
+   le texte est illisible (plan entier à l'écran) : on zoome alors pour qu'il soit lisible. */
+static void find_show(void)
+{
+	Tab *t = T;
+	float x0, y0, x1, y1;
+	double m = 40 * ui, th;
+	if (find_page < 0) return;
+	show_row_of(find_page);
+	if (!find_hit_rect(find_page, find_hit, &x0, &y0, &x1, &y1)) return;
+	th = find_hit_height(find_page, find_hit);
+	if (th > 0 && th < 7 * ui) {
+		int L = t->level + (int)lround(LPO * log2(22 * ui / th));
+		L = grid_floor(L + GRID / 2);
+		t->fit_mode = FIT_NONE;
+		zoom_at(L, (x0 + x1) / 2.0, (y0 + y1) / 2.0);
+		if (!find_hit_rect(find_page, find_hit, &x0, &y0, &x1, &y1)) return;
+		x0 -= (float)vw; x1 += (float)vw;   /* force le centrage ci-dessous */
+	}
+	if (x0 < m || y0 < m || x1 > vw - m || y1 > vh - m) {
+		t->sx += (x0 + x1) / 2.0 - vw / 2.0;
+		t->sy += (y0 + y1) / 2.0 - vh / 2.0;
+		clamp_scroll();
+	}
+	view_dirty = dirty = 1;
+}
+
+/* Résultat suivant (dir = +1) ou précédent (-1). Si la page concernée n'a pas encore été
+   cherchée, on attend (find_want) et l'on y va dès que ses résultats arrivent. */
+static void find_move(int dir)
+{
+	Tab *t = T;
+	int i, k, start, from_hit;
+	if (!find_active()) return;
+	find_want = 0;
+	from_hit = find_page >= 0;
+	if (from_hit) {
+		int h = find_hit + dir;
+		if (h >= 0 && h < t->pages[find_page].nfhits) {
+			find_hit = h;
+			find_show();
+			return;
+		}
+		start = find_page;
+	} else {
+		start = current_page() - dir;   /* la page courante est examinée en premier */
+	}
+	for (k = 1; k <= t->npages; k++) {
+		Page *p;
+		i = ((start + dir * k) % t->npages + t->npages) % t->npages;
+		p = &t->pages[i];
+		if (p->fgen != find_gen) { find_want = dir; return; }   /* pas encore cherchée : on attend */
+		if (p->nfhits > 0) {
+			if (from_hit && (dir > 0 ? i <= start : i >= start))
+				set_toast(dir > 0 ? "Fin du document : reprise au d\xc3\xa9""but"
+						: "D\xc3\xa9""but du document : reprise \xc3\xa0 la fin");
+			find_page = i;
+			find_hit = dir > 0 ? 0 : p->nfhits - 1;
+			find_show();
+			return;
+		}
+	}
+}
+
+/* totaux pour la barre : résultats trouvés, rang du courant (-1 tant que des pages
+   qui le précèdent n'ont pas été cherchées), pages restant à chercher */
+static void find_counts(int *total, int *rank, int *pending)
+{
+	Tab *t = T;
+	int i, before = 0;
+	*total = *pending = 0;
+	*rank = 0;
+	for (i = 0; i < t->npages; i++) {
+		Page *p = &t->pages[i];
+		if (p->fgen != find_gen) { (*pending)++; if (i < find_page) before = 1; continue; }
+		if (i < find_page) *rank += p->nfhits;
+		*total += p->nfhits;
+	}
+	if (find_page >= 0) *rank += find_hit + 1;
+	if (before) *rank = -1;
+}
+
+/* état de la recherche (banc de test) */
+void core_find_info(int *total, int *rank, int *pending, int *page)
+{
+	*total = *rank = *pending = 0;
+	*page = -1;
+	if (!find_active()) return;
+	find_counts(total, rank, pending);
+	*page = find_page;
+}
+
+/* une tranche de recherche (appelée à chaque image) */
+static void find_step(void)
+{
+	Tab *t = T;
+	double t0 = platform_time();
+	int k, start, done_any = 0;
+	find_more = 0;
+	if (!find_active() || t0 < find_due) return;
+	find_due = 0;
+	start = find_page >= 0 ? find_page : current_page();
+	for (k = 0; k < t->npages; k++) {
+		int i = (start + k) % t->npages;
+		Page *p = &t->pages[i];
+		int ss, ls;
+		if (p->fgen == find_gen) continue;
+		mutex_lock(&mu);            /* le texte est publié par les chargeurs sous ce verrou */
+		ss = p->sstate;
+		ls = p->lstate;
+		mutex_unlock(&mu);
+		if (ss == L_ERROR || ls == L_ERROR) {   /* page illisible : rien à y trouver */
+			free(p->fq); free(p->fmark); p->fq = NULL; p->fmark = NULL;
+			p->nfq = p->nfhits = 0;
+			p->fgen = find_gen;
+			done_any = 1;
+			continue;
+		}
+		if (ss != L_READY || !p->stext) continue;
+		find_search_page(p);
+		p->fgen = find_gen;
+		done_any = 1;
+		/* tranche limitée pour rester fluide : plus courte pendant un déplacement ou un zoom */
+		if (platform_time() - t0 > (drag != DRAG_NONE || auto_active() ? 0.004 : 0.010)) { find_more = 1; break; }
+	}
+	if (done_any) {
+		dirty = 1;
+		if (find_want) find_move(find_want);
+	}
+}
+
 /* ---------- planification ---------- */
 
 /* Tuiles du niveau L couvrant la partie de la page p visible à l'écran, élargie
@@ -1396,11 +1782,11 @@ static int evict_R;
 static int cmp_used(const void *a, const void *b)
 {
 	const Job *x = *(Job *const *)a, *y = *(Job *const *)b;
-	int dx, dy;
+	long long dx, dy;
 	if (x->used != y->used) return x->used < y->used ? -1 : 1;
-	/* à âge égal, on libère d'abord les niveaux éloignés du zoom courant */
-	dx = abs(x->level - evict_R);
-	dy = abs(y->level - evict_R);
+	/* à âge égal, on libère d'abord les niveaux éloignés du zoom courant (l'aperçu est à INT_MIN) */
+	dx = llabs((long long)x->level - evict_R);
+	dy = llabs((long long)y->level - evict_R);
 	return dx > dy ? -1 : dx < dy;
 }
 
@@ -1428,7 +1814,9 @@ static void evict(void)
 		evict_cur = current_page();
 		for (k = 0; k < t->npages; k++) {
 			Page *p = &t->pages[k];
-			if (p->lstate == L_READY && !(p->lused == gen && p->urgent)) idx[m++] = k;
+			if (p->lstate == L_READY && !(p->lused == gen && p->urgent) &&
+					!(find_active() && p->fgen != find_gen && p->sstate != L_READY))   /* texte pas encore cherché */
+				idx[m++] = k;
 		}
 		if (m > 1) qsort(idx, m, sizeof *idx, cmp_lused);
 		mutex_lock(&mu);
@@ -1438,23 +1826,43 @@ static void evict(void)
 		free(idx);
 	}
 
-	/* textes extraits : au plus 6 pages hors écran */
-	{
+	/* textes extraits : au plus 6 pages hors écran ; pendant une recherche, tous ceux
+	   qui tiennent dans le budget (pour chercher autre chose sans tout réextraire) */
+	mutex_lock(&mu);   /* l'état du texte est modifié par les chargeurs sous ce verrou */
+	if (find_active()) {
+		size_t sb = 0, sbudget = list_budget / 4;
+		for (k = 0; k < t->npages; k++)
+			if (t->pages[k].sstate == L_READY) sb += t->pages[k].sbytes;
+		if (sb > sbudget) {
+			int cur = current_page(), dd;
+			for (dd = t->npages; dd > 0 && sb > sbudget / 10 * 9; dd--) {
+				int side;
+				for (side = 0; side < 2; side++) {
+					int i = side ? cur - dd : cur + dd;
+					Page *p;
+					if (i < 0 || i >= t->npages) continue;
+					p = &t->pages[i];
+					if (p->sstate == L_READY && p->fgen == find_gen && !(p->lused == gen && p->urgent) &&
+							!(sel_on && sel_tab == t && sel_page == i)) {
+						sb -= p->sbytes;
+						drop_stext(p);
+					}
+				}
+			}
+		}
+	} else {
 		int ns = 0;
 		for (k = 0; k < t->npages; k++)
 			if (t->pages[k].sstate == L_READY) ns++;
-		if (ns > 6) {
-			mutex_lock(&mu);
-			for (k = 0; k < t->npages && ns > 6; k++) {
-				Page *p = &t->pages[k];
-				if (p->sstate == L_READY && !(p->lused == gen && p->urgent) && !(sel_on && sel_tab == t && sel_page == k)) {
-					drop_stext(p);
-					ns--;
-				}
+		for (k = 0; k < t->npages && ns > 6; k++) {
+			Page *p = &t->pages[k];
+			if (p->sstate == L_READY && !(p->lused == gen && p->urgent) && !(sel_on && sel_tab == t && sel_page == k)) {
+				drop_stext(p);
+				ns--;
 			}
-			mutex_unlock(&mu);
 		}
 	}
+	mutex_unlock(&mu);
 
 	/* tuiles */
 	if (t->tex_bytes <= tex_budget && t->njobs < 40000) return;
@@ -1591,6 +1999,30 @@ static void schedule(void)
 		if (t->pages[i].lstate != L_READY) continue;
 		while (m < 64 && (size_t)((a + 2 * (m + 1)) * (b + 2 * (m + 1)) - a * b) <= room) m++;
 		if (m > 0) want_area(t, i, R, (double)m * TILE, (double)m * TILE, 5e9, limit);
+	}
+
+	/* recherche en cours : il faut le texte de toutes les pages, en partant de la page
+	   courante. Les pages pas encore analysées le sont quelques-unes à la fois (au-delà
+	   du budget mémoire, leur display list sera libérée une fois le texte extrait). */
+	stext_from = find_active() ? cur : 0;
+	if (find_active()) {
+		int pending = 0;
+		for (d = 0; d < t->npages; d++) {
+			Page *p;
+			i = (cur + d) % t->npages;
+			p = &t->pages[i];
+			if (p->fgen == find_gen || p->sstate == L_READY || p->sstate == L_ERROR || p->lstate == L_ERROR) continue;
+			if (p->lstate == L_READY) {
+				if (p->sstate == L_NONE) p->sstate = L_QUEUED;
+				p->lused = gen;
+				pending++;
+			} else if (p->lused == gen) {
+				pending++;
+			} else if (pending < 2 * nloaders + 2) {
+				queue_page(t, i, 0);
+				pending++;
+			}
+		}
 	}
 
 	/* passe 4 : analyse de toutes les autres pages en tâche de fond, des plus proches
@@ -2381,6 +2813,34 @@ static void draw_pages(void)
 					drawn = 1;
 				}
 			}
+		/* résultats de la recherche : jaune, le résultat courant en orange */
+		if (find_active() && p->fgen == find_gen && p->nfq > 0) {
+			fz_matrix m = view_ctm(t->rot, t->scale);
+			int q;
+			for (q = 0; q < p->nfq; q++) {
+				fz_quad v = fz_transform_quad(p->fq[q], m);
+				float xy[8];
+				int cur = i == find_page && p->fmark[q] == find_hit;
+				xy[0] = X + v.ul.x - p->pbox.x0; xy[1] = Y + v.ul.y - p->pbox.y0;
+				xy[2] = X + v.ur.x - p->pbox.x0; xy[3] = Y + v.ur.y - p->pbox.y0;
+				xy[4] = X + v.lr.x - p->pbox.x0; xy[5] = Y + v.lr.y - p->pbox.y0;
+				xy[6] = X + v.ll.x - p->pbox.x0; xy[7] = Y + v.ll.y - p->pbox.y0;
+				gfx_quad(xy, cur ? 0x99ff6a00 : 0x66ffd000);
+			}
+			/* résultat courant trop petit pour être vu (vue d'ensemble) : cerclé */
+			if (i == find_page) {
+				float a0, b0, a1, b1, r = 14 * ui, lw = 2 * ui;
+				if (find_hit_rect(i, find_hit, &a0, &b0, &a1, &b1) && fminf(a1 - a0, b1 - b0) < 12 * ui) {
+					float cx = (a0 + a1) / 2, cy = (b0 + b1) / 2;
+					a0 = fminf(a0 - 3 * ui, cx - r); a1 = fmaxf(a1 + 3 * ui, cx + r);
+					b0 = fminf(b0 - 3 * ui, cy - r); b1 = fmaxf(b1 + 3 * ui, cy + r);
+					gfx_rect(a0, b0, a1, b0 + lw, 0xffff6a00);
+					gfx_rect(a0, b1 - lw, a1, b1, 0xffff6a00);
+					gfx_rect(a0, b0 + lw, a0 + lw, b1 - lw, 0xffff6a00);
+					gfx_rect(a1 - lw, b0 + lw, a1, b1 - lw, 0xffff6a00);
+				}
+			}
+		}
 		/* texte sélectionné : surlignage bleu translucide (les quadrilatères suivent les textes inclinés) */
 		if (sel_on && sel_tab == t && sel_page == i && nselq > 0) {
 			fz_matrix m = view_ctm(t->rot, t->scale);
@@ -2420,6 +2880,7 @@ static const char *help_lines[][2] = {
 	{ "D\xc3\xa9placer la vue", "Clic gauche + glisser (hors du texte)" },
 	{ "S\xc3\xa9lectionner du texte", "Clic gauche + glisser sur le texte, double-clic : un mot" },
 	{ "Copier / tout s\xc3\xa9lectionner (page)", "Ctrl+C  /  Ctrl+A" },
+	{ "Rechercher du texte", "Ctrl+F, puis Entr\xc3\xa9""e / Maj+Entr\xc3\xa9""e (ou F3)" },
 	{ "D\xc3\xa9""filement automatique", "Maintenir le clic molette, viser la direction" },
 	{ "Page enti\xc3\xa8re / pleine largeur", "F (Ctrl+0)  /  L (Ctrl+2)" },
 	{ "Taille r\xc3\xa9""elle (100 %)", "Ctrl+1" },
@@ -2460,6 +2921,19 @@ static void draw_help(void)
 		draw_text(help_lines[i][0], px, 0, x0 + pad, y, 0xffc9ccd1);
 		draw_text(help_lines[i][1], px, 1, x0 + 2 * pad + w0, y, 0xffffffff);
 	}
+}
+
+/* trait épais quelconque (icônes vectorielles simples) */
+static void line_quad(float x0, float y0, float x1, float y1, float w, unsigned argb)
+{
+	float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy), nx, ny, xy[8];
+	if (l <= 0) return;
+	nx = -dy / l * w / 2; ny = dx / l * w / 2;
+	xy[0] = x0 + nx; xy[1] = y0 + ny;
+	xy[2] = x1 + nx; xy[3] = y1 + ny;
+	xy[4] = x1 - nx; xy[5] = y1 - ny;
+	xy[6] = x0 - nx; xy[7] = y0 - ny;
+	gfx_quad(xy, argb);
 }
 
 static void draw_overlays(void)
@@ -2548,7 +3022,69 @@ static void draw_overlays(void)
 		draw_text(toast, big, 1, x0 + pad, y0 + pad, 0xffffffff);
 	}
 
-	if (input_mode != INPUT_NONE) {
+	if (input_mode == INPUT_FIND && has_doc()) {
+		/* barre de recherche en haut à droite : libellé, champ, compteur, ‹préc.› ‹suiv.› ‹fermer› */
+		int px = (int)(14 * ui), total, rank, pending, k;
+		float pad = 8 * ui, fw = 230 * ui, wc, h, x0, y0 = 8 * ui, x1, fx0, fx1, tx, ty;
+		char cnt[96];
+		const char *shown = find_q;
+		find_counts(&total, &rank, &pending);
+		if (!find_q[0]) cnt[0] = 0;
+		else if (pending && total == 0) snprintf(cnt, sizeof cnt, "recherche\xe2\x80\xa6");
+		else if (total == 0) snprintf(cnt, sizeof cnt, "aucun r\xc3\xa9sultat");
+		else if (find_page >= 0 && rank > 0) snprintf(cnt, sizeof cnt, "%d / %d%s", rank, total, pending ? "+" : "");
+		else snprintf(cnt, sizeof cnt, "%d r\xc3\xa9sultat%s%s", total, total > 1 ? "s" : "", pending ? "+" : "");
+		h = text_get("Rechercher", px, 0)->h + 2 * pad;
+		fbar_btn = h;
+		wc = fmaxf(text_measure("8888 / 88888", px - 1, 0), cnt[0] ? text_measure(cnt, px - 1, 0) : 0);
+		x1 = vw - (T->ch > vh ? sbw : 0) - 12 * ui;
+		x0 = x1 - (text_measure("Rechercher", px, 1) + fw + wc + 3 * h + 5 * pad);
+		if (x0 < 8 * ui) { fw -= 8 * ui - x0; x0 = 8 * ui; if (fw < 60 * ui) fw = 60 * ui; }
+		fbar_x0 = x0; fbar_y0 = y0; fbar_x1 = x1; fbar_y1 = y0 + h;
+		gfx_rect(x0, y0, x1, y0 + h, 0xf4202226);
+		gfx_rect(x0, y0, x1, y0 + 2 * ui, 0xff4a90d9);
+		ty = y0 + pad;
+		tx = x0 + pad;
+		tx += draw_text("Rechercher", px, 1, tx, ty, 0xff9aa0a8) + pad;
+		/* champ de saisie */
+		fx0 = tx; fx1 = tx + fw;
+		gfx_rect(fx0, y0 + 5 * ui, fx1, y0 + h - 5 * ui, 0xff3a3d42);
+		gfx_rect(fx0 + 1, y0 + 5 * ui + 1, fx1 - 1, y0 + h - 5 * ui - 1, 0xff141518);
+		/* texte trop long : on montre la fin */
+		while (*shown && text_measure(shown, px, 0) > fw - 14 * ui) {
+			shown++;
+			while ((*shown & 0xc0) == 0x80) shown++;
+		}
+		if (*shown) {
+			float w = (float)text_width(shown, px, 0);
+			if (find_fresh) gfx_rect(fx0 + 5 * ui, y0 + 7 * ui, fx0 + 5 * ui + w, y0 + h - 7 * ui, 0xff3d6fb0);
+			draw_text(shown, px, 0, fx0 + 5 * ui, ty, 0xffffffff);
+			if (!find_fresh) gfx_rect(fx0 + 5 * ui + w - 1, y0 + 9 * ui, fx0 + 5 * ui + w + 0.6f * ui, y0 + h - 9 * ui, 0xffffffff);
+		} else {
+			gfx_rect(fx0 + 6 * ui, y0 + 9 * ui, fx0 + 6 * ui + 1.2f * ui, y0 + h - 9 * ui, 0xffffffff);
+			draw_text("Entr\xc3\xa9""e : suivant", px - 1, 0, fx0 + 12 * ui, ty + 1, 0xff6c7178);
+		}
+		tx = fx1 + pad;
+		if (cnt[0])
+			draw_text(cnt, px - 1, 0, tx, ty + 1, total == 0 && !pending ? 0xffe8a0a0 : 0xffb8bec6);
+		/* boutons */
+		for (k = 0; k < 3; k++) {
+			float bx = x1 - (3 - k) * h, cx = bx + h / 2, cy = y0 + h / 2 + 1 * ui, sz = 4.5f * ui, lw = 1.6f * ui;
+			unsigned col = (k < 2 && total == 0) ? 0xff5c6168 : 0xffd0d4da;
+			fbtn_x[k] = bx;
+			if (find_hover == k + 1) gfx_rect(bx + 2 * ui, y0 + 4 * ui, bx + h - 2 * ui, y0 + h - 2 * ui, 0xff3a3d42);
+			if (k == 0) {          /* précédent : chevron vers le haut */
+				line_quad(cx - sz, cy + sz / 2, cx, cy - sz / 2, lw, col);
+				line_quad(cx, cy - sz / 2, cx + sz, cy + sz / 2, lw, col);
+			} else if (k == 1) {   /* suivant : chevron vers le bas */
+				line_quad(cx - sz, cy - sz / 2, cx, cy + sz / 2, lw, col);
+				line_quad(cx, cy + sz / 2, cx + sz, cy - sz / 2, lw, col);
+			} else {               /* fermer */
+				line_quad(cx - sz, cy - sz, cx + sz, cy + sz, lw, col);
+				line_quad(cx - sz, cy + sz, cx + sz, cy - sz, lw, col);
+			}
+		}
+	} else if (input_mode != INPUT_NONE) {
 		int big = (int)(17 * ui), pad = (int)(16 * ui), w;
 		float x0, y0, bw = 360 * ui;
 		if (input_mode == INPUT_GOTO) {
@@ -2600,6 +3136,7 @@ void core_draw(void)
 {
 	autoscroll_step();
 	if (sel_dirty) { sel_dirty = 0; update_selection(); }
+	find_step();
 	if (view_dirty || need_schedule) {
 		view_dirty = need_schedule = 0;
 		schedule();
@@ -2612,7 +3149,7 @@ void core_draw(void)
 	draw_tabbar();
 	draw_tooltip();
 	gfx_end();
-	dirty = 0;
+	dirty = find_more;   /* recherche pas finie : on continue à l'image suivante */
 }
 
 int core_dirty(void)
@@ -2628,6 +3165,10 @@ int core_timeout_ms(void)
 	else if (toast[0]) { toast[0] = 0; dirty = 1; }
 	if (hover != HIT_NONE && !drag && t - hover_since < 0.5) {
 		int h = (int)((0.5 - (t - hover_since)) * 1000) + 20;
+		if (ms < 0 || h < ms) ms = h;
+	}
+	if (find_active() && find_due > 0) {
+		int h = t < find_due ? (int)((find_due - t) * 1000) + 5 : 1;
 		if (ms < 0 || h < ms) ms = h;
 	}
 	return ms;
@@ -2648,7 +3189,7 @@ static void update_title(void)
 static void activate(int idx)
 {
 	if (idx < 0 || idx >= ntabs) return;
-	if (T && tabs[idx] != T) clear_selection();
+	if (T && tabs[idx] != T) { clear_selection(); if (find_tab) find_close(); }
 	if (T && tabs[idx] != T) {
 		stop_tab_work(T);
 		trim_tab(T);
@@ -2686,6 +3227,7 @@ static void close_tab(int idx)
 	if (idx < 0 || idx >= ntabs) return;
 	t = tabs[idx];
 	if (sel_tab == t) clear_selection();
+	if (find_tab == t) find_close();
 	quiesce();
 	if (t->doc && !t->need_password) remember_closed(t->path);
 	if (was_active) T = NULL;
@@ -2851,6 +3393,7 @@ void core_reload(void)
 	ox = t->sx; oy = t->sy;
 	path = strdup(t->path);
 	if (sel_tab == t) clear_selection();
+	if (find_tab == t) find_close();
 	quiesce();
 	tab_clear(t);
 	fz_var(d);
@@ -3089,6 +3632,18 @@ void core_mouse_down(int btn, int x, int y, int mods)
 	mx = x; my = y;
 	if (input_mode == INPUT_GOTO) input_cancel();
 	if (input_mode == INPUT_PASSWORD) return;
+	{
+		int fh = find_bar_hit(x, y);
+		if (fh) {
+			if (btn == BTN_LEFT) {
+				if (fh == 1) find_move(-1);
+				else if (fh == 2) find_move(1);
+				else if (fh == 3) find_close();
+				else find_fresh = 0;   /* clic dans le champ : on continue le texte */
+			}
+			return;
+		}
+	}
 	if (!has_doc()) {
 		if (btn == BTN_LEFT) platform_open_dialog();
 		return;
@@ -3163,12 +3718,15 @@ void core_mouse_move(int x, int y, int mods)
 		}
 		break;
 	}
-	case DRAG_NONE:
-		if (y >= 0) {
+	case DRAG_NONE: {
+		int fh = y >= 0 ? find_bar_hit(x, y) : 0, nh = fh == 4 ? 0 : fh;
+		if (nh != find_hover) { find_hover = nh; dirty = 1; }
+		if (y >= 0 && !fh) {
 			int ht = text_at(x, y);
 			if (ht != hover_text) hover_text = ht;
 		} else hover_text = 0;
 		break;
+	}
 	case DRAG_VBAR:
 		if (vbar(&a, &b, &c, &d, &t0, &t1)) {
 			double len = d - b, th = t1 - t0;
@@ -3261,8 +3819,76 @@ void core_key(int key, int mods)
 		case 'W': case K_F4: if (T) close_tab(active); return;
 		case 'T': if (shift) reopen_closed(); else platform_open_dialog(); return;
 		case 'O': if (shift) open_with(); else platform_open_dialog(); return;
+		case 'F': if (input_mode != INPUT_PASSWORD) { if (input_mode == INPUT_GOTO) input_mode = INPUT_NONE; find_open(); } return;
+		case 'V':
+			if (input_mode == INPUT_FIND) {
+				char *c = platform_get_clipboard();
+				if (c) {
+					char *nl = strpbrk(c, "\r\n"), *tb;
+					size_t n, k;
+					if (nl) *nl = 0;                         /* première ligne seulement */
+					for (tb = c; *tb; tb++) if (*tb == '\t') *tb = ' ';
+					if (find_fresh) find_q[0] = 0;
+					find_fresh = 0;
+					n = strlen(find_q);
+					snprintf(find_q + n, sizeof find_q - n, "%s", c);
+					/* texte tronqué : ne pas laisser un caractère UTF-8 coupé en deux */
+					k = strlen(find_q);
+					if (k + 1 >= sizeof find_q) {
+						size_t b = k;
+						while (b > 0 && ((unsigned char)find_q[b - 1] & 0xc0) == 0x80) b--;
+						if (b > 0 && ((unsigned char)find_q[b - 1] & 0x80)) {
+							unsigned char lead = (unsigned char)find_q[b - 1];
+							size_t need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+							if (k - (b - 1) < need) find_q[b - 1] = 0;
+						}
+					}
+					free(c);
+					if (find_q[0]) find_restart(1);
+				}
+				return;
+			}
+			break;
 		case 'Q': platform_quit(); return;
 		}
+	}
+	if (key == K_F3 && input_mode != INPUT_PASSWORD) {
+		if (!find_active()) { find_open(); find_want = shift ? -1 : 1; }
+		else find_move(shift ? -1 : 1);
+		return;
+	}
+	if (input_mode == INPUT_FIND) {
+		if (key == K_ENTER) {
+			find_fresh = 0;
+			if (find_active()) {
+				if (find_due > platform_time()) find_due = 0;   /* lance tout de suite */
+				find_move(shift ? -1 : 1);
+			}
+		} else if (key == K_ESC) {
+			find_close();
+		} else if (key == K_BACKSPACE) {
+			int n = (int)strlen(find_q);
+			if (find_fresh) n = 0;
+			else {
+				while (n > 0 && (find_q[n - 1] & 0xc0) == 0x80) n--;
+				if (n > 0) n--;
+			}
+			find_q[n] = 0;
+			find_fresh = 0;
+			if (find_q[0]) find_restart(1);
+			else { find_reset_results(find_tab); find_page = find_hit = -1; dirty = 1; }
+		} else if (key == K_PGDN || key == K_PGUP || key == K_HOME || key == K_END ||
+				key == K_UP || key == K_DOWN || key == K_LEFT || key == K_RIGHT) {
+			int m = input_mode;   /* la navigation reste possible, barre ouverte */
+			input_mode = INPUT_NONE;
+			core_key(key, mods);
+			input_mode = m;
+		} else if (ctrl || key == K_F1 || key == K_F5 || key == K_F11) {
+			/* zoom, rotation, copie, plein écran… restent disponibles, barre ouverte */
+			if (ctrl && key == 'G') find_close();
+			goto shortcuts;
+		}
+		return;
 	}
 	if (input_mode != INPUT_NONE) {
 		if (key == K_ENTER) input_commit();
@@ -3275,6 +3901,7 @@ void core_key(int key, int mods)
 		}
 		return;
 	}
+shortcuts:
 	if (show_help && (key == K_ESC || key == K_F1)) { show_help = 0; return; }
 	if (ctrl) {
 		switch (key) {
@@ -3340,9 +3967,24 @@ void core_char(unsigned c)
 		if (c >= '0' && c <= '9' && n < 9) { input_buf[n] = (char)c; input_buf[n + 1] = 0; }
 		return;
 	}
+	if (input_mode == INPUT_FIND) {
+		size_t n;
+		if (c < 32 || c == 127) return;   /* 127 : Ctrl+Retour arrière */
+		if (find_fresh) find_q[0] = 0;
+		find_fresh = 0;
+		n = strlen(find_q);
+		if (n + 5 < sizeof find_q) {
+			char tmp[8];
+			int k = fz_runetochar(tmp, (int)c);
+			memcpy(find_q + n, tmp, k);
+			find_q[n + k] = 0;
+			find_restart(1);
+		}
+		return;
+	}
 	if (input_mode == INPUT_PASSWORD) {
 		size_t n = strlen(input_buf);
-		if (c >= 32 && n + 4 < sizeof input_buf) {
+		if (c >= 32 && c != 127 && n + 4 < sizeof input_buf) {
 			char tmp[8];
 			int k = fz_runetochar(tmp, (int)c);
 			memcpy(input_buf + n, tmp, k);

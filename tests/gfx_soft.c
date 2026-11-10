@@ -116,16 +116,37 @@ void gfx_rect(float x0, float y0, float x1, float y1, unsigned argb)
 			blend_px(fb + ((size_t)y * fbw + x) * 4, b * a / 255, g * a / 255, r * a / 255, a);
 }
 
-/* banc de test : le quadrilatère est approché par son rectangle englobant */
+/* quadrilatère convexe, sans lissage (banc de test) */
 void gfx_quad(const float *xy, unsigned argb)
 {
-	float x0 = xy[0], x1 = xy[0], y0 = xy[1], y1 = xy[1];
-	int k;
+	float x0 = xy[0], x1 = xy[0], y0 = xy[1], y1 = xy[1], area = 0;
+	int k, X, Y, X0, X1, Y0, Y1, a = argb >> 24, r = (argb >> 16) & 255, g = (argb >> 8) & 255, b = argb & 255;
+	soft_calls++;
+	if (!soft_enabled) return;
 	for (k = 1; k < 4; k++) {
 		x0 = fminf(x0, xy[2 * k]); x1 = fmaxf(x1, xy[2 * k]);
 		y0 = fminf(y0, xy[2 * k + 1]); y1 = fmaxf(y1, xy[2 * k + 1]);
 	}
-	gfx_rect(x0, y0, x1, y1, argb);
+	for (k = 0; k < 4; k++) {
+		int n = (k + 1) & 3;
+		area += xy[2 * k] * xy[2 * n + 1] - xy[2 * n] * xy[2 * k + 1];
+	}
+	X0 = (int)floorf(x0 + ox); X1 = (int)ceilf(x1 + ox); Y0 = (int)floorf(y0 + oy); Y1 = (int)ceilf(y1 + oy);
+	if (X0 < 0) X0 = 0;
+	if (Y0 < 0) Y0 = 0;
+	if (X1 > fbw) X1 = fbw;
+	if (Y1 > fbh) Y1 = fbh;
+	for (Y = Y0; Y < Y1; Y++)
+		for (X = X0; X < X1; X++) {
+			float px = X + 0.5f - ox, py = Y + 0.5f - oy;
+			int in = 1;
+			for (k = 0; k < 4 && in; k++) {
+				int n = (k + 1) & 3;
+				float c = (xy[2 * n] - xy[2 * k]) * (py - xy[2 * k + 1]) - (xy[2 * n + 1] - xy[2 * k + 1]) * (px - xy[2 * k]);
+				if ((area > 0 && c < 0) || (area < 0 && c > 0)) in = 0;
+			}
+			if (in) blend_px(fb + ((size_t)Y * fbw + X) * 4, b * a / 255, g * a / 255, r * a / 255, a);
+		}
 }
 
 void gfx_end(void) {}

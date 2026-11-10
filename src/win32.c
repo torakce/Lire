@@ -473,6 +473,23 @@ void platform_set_clipboard(const char *utf8)
 	free(w);
 }
 
+char *platform_get_clipboard(void)
+{
+	char *r = NULL;
+	HANDLE h;
+	if (!OpenClipboard(hwnd)) return NULL;
+	h = GetClipboardData(CF_UNICODETEXT);
+	if (h) {
+		const wchar_t *w = GlobalLock(h);
+		if (w) {
+			r = to_utf8(w);
+			GlobalUnlock(h);
+		}
+	}
+	CloseClipboard();
+	return r;
+}
+
 void platform_toggle_fullscreen(void)
 {
 	if (!fullscreen) {
@@ -596,6 +613,7 @@ static int map_key(WPARAM vk)
 	case VK_F1: return K_F1;
 	case VK_F5: return K_F5;
 	case VK_F11: return K_F11;
+	case VK_F3: return K_F3;
 	case VK_TAB: return K_TAB;
 	case VK_F4: return K_F4;
 	}
@@ -756,6 +774,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 				return 0;
 			}
 		}
+		/* AltGr (= Ctrl+Alt) sert à taper @ # { [ | € … : ce n'est pas un raccourci Ctrl */
+		if ((m & LMOD_CTRL) && (m & LMOD_ALT) && map_key(wp) < 256) break;
 		if ((m & LMOD_CTRL) && (wp == VK_ADD || wp == VK_OEM_PLUS)) { core_key(K_PLUS, m); refresh(); return 0; }
 		if ((m & LMOD_CTRL) && (wp == VK_SUBTRACT || wp == VK_OEM_MINUS || wp == '6')) { core_key(K_MINUS, m); refresh(); return 0; }
 		k = map_key(wp);

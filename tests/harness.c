@@ -30,6 +30,8 @@ void platform_open_dialog(void) {}
 int platform_popup_menu(const char *const *l, const int *f, int n, int x, int y) { (void)l; (void)f; (void)n; (void)x; (void)y; return -1; }
 char last_clipboard[4096];
 void platform_set_clipboard(const char *t) { snprintf(last_clipboard, sizeof last_clipboard, "%s", t); }
+char paste_buf[256];
+char *platform_get_clipboard(void) { return paste_buf[0] ? strdup(paste_buf) : NULL; }
 void platform_open_with(const char *p, int x, int y) { printf("  [ouvrir avec] %s (bouton %d,%d)\n", p, x, y); }
 void platform_toggle_fullscreen(void) {}
 void platform_quit(void) {}
@@ -166,6 +168,21 @@ int main(int argc, char **argv)
 			case 20: core_key('T', LMOD_CTRL | LMOD_SHIFT); break;
 			case 21: core_mouse_down(BTN_MIDDLE, x, 15, 0); core_mouse_up(BTN_MIDDLE, x, 15, 0); break;
 			}
+			/* recherche (Ctrl+F) mêlée au reste */
+			seed = seed * 1103515245 + 12345;
+			if ((seed >> 16) % 17 == 0) {
+				static const char *words[] = { "H7", "lorem", "tol\xc3\xa9rance", "Page 3", "zz", "A-A", "e" };
+				const char *w;
+				switch ((seed >> 8) % 7) {
+				case 0: core_key('F', LMOD_CTRL); for (w = words[(seed >> 20) % 7]; *w; w++) core_char((unsigned char)*w); break;
+				case 1: core_key(K_ENTER, 0); break;
+				case 2: core_key(K_ENTER, LMOD_SHIFT); break;
+				case 3: core_key(K_F3, (seed >> 4) & 1 ? LMOD_SHIFT : 0); break;
+				case 4: core_key(K_ESC, 0); break;
+				case 5: core_key(K_BACKSPACE, 0); break;
+				case 6: core_key(K_PGDN, 0); break;
+				}
+			}
 			core_poll();
 			core_draw();
 			if (core_tab_count() > maxtabs) maxtabs = core_tab_count();
@@ -231,6 +248,131 @@ int main(int argc, char **argv)
 		core_char('f');
 		pump("retour : une page, continu", 120);
 		core_stats(st, sizeof st); printf("  %s\n", st);
+		core_shutdown();
+		printf("textures restantes : %ld octets\n", soft_tex_bytes);
+		return 0;
+	}
+	if (argc > 4 && !strcmp(argv[4], "recherche")) {
+		/* Ctrl+F : saisie incrémentale, comptage sur tout le document, Entrée / Maj+Entrée / F3, Échap */
+		extern char paste_buf[256];
+		const char *q1 = argc > 5 ? argv[5] : "tolerance", *q2 = argc > 6 ? argv[6] : "Page 317";
+		int tot, rk, pend, pg, k;
+		double worst_frame = 0, tf;
+		const char *c;
+		core_open(file);
+		pump("ouverture", 120);
+		core_key('F', LMOD_CTRL);
+		t0 = platform_time();
+		for (c = q1; *c; c++) {
+			unsigned char ch = (unsigned char)*c;
+			core_char(ch);
+			tf = frame_cost(); if (tf > worst_frame) worst_frame = tf;
+		}
+		for (;;) {
+			tf = frame_cost(); if (tf > worst_frame) worst_frame = tf;
+			core_find_info(&tot, &rk, &pend, &pg);
+			if (!pend) break;
+			if (platform_time() - t0 > 120) { printf("!! recherche non terminée\n"); break; }
+			wait_wake(0.02);
+		}
+		printf("[%s] : %d résultats, courant %d (page %d), cherché en %.0f ms, image la plus lente %.1f ms, page affichée %d\n",
+			q1, tot, rk, pg + 1, (platform_time() - t0) * 1000, worst_frame, core_current_page() + 1);
+		pump("  vue nette sur le 1er résultat", 120);
+		save("f01_premier.png");
+		for (k = 0; k < 3; k++) core_key(K_ENTER, 0);
+		core_find_info(&tot, &rk, &pend, &pg);
+		printf("  3 x Entrée : courant %d / %d (page %d), page affichée %d\n", rk, tot, pg + 1, core_current_page() + 1);
+		core_key(K_ENTER, LMOD_SHIFT);
+		core_find_info(&tot, &rk, &pend, &pg);
+		printf("  Maj+Entrée : courant %d / %d (page %d)\n", rk, tot, pg + 1);
+		core_key(K_F3, 0); core_key(K_F3, LMOD_SHIFT); core_key(K_F3, LMOD_SHIFT);
+		core_find_info(&tot, &rk, &pend, &pg);
+		printf("  F3, Maj+F3 x2 : courant %d / %d (page %d)\n", rk, tot, pg + 1);
+		/* dernier résultat puis Entrée : retour au premier */
+		for (k = 0; k < tot - rk; k++) core_key(K_ENTER, 0);
+		core_find_info(&tot, &rk, &pend, &pg);
+		printf("  jusqu'au dernier : courant %d / %d (page %d)\n", rk, tot, pg + 1);
+		core_key(K_ENTER, 0);
+		core_find_info(&tot, &rk, &pend, &pg);
+		printf("  Entrée après le dernier : courant %d / %d (page %d)\n", rk, tot, pg + 1);
+		pump("  vue nette", 120);
+		save("f02_rebouclage.png");
+		/* nouvelle recherche : Ctrl+F sélectionne le texte, la frappe le remplace */
+		core_key('F', LMOD_CTRL);
+		t0 = platform_time();
+		for (c = q2; *c; c++) core_char((unsigned char)*c);
+		for (;;) {
+			core_poll(); core_draw();
+			core_find_info(&tot, &rk, &pend, &pg);
+			if (!pend && rk > 0) break;
+			if (!pend && tot == 0) break;
+			if (platform_time() - t0 > 120) break;
+			wait_wake(0.02);
+		}
+		printf("[%s] : %d résultats, courant %d (page %d), %.0f ms, page affichée %d\n",
+			q2, tot, rk, pg + 1, (platform_time() - t0) * 1000, core_current_page() + 1);
+		pump("  vue nette", 120);
+		save("f03_seconde.png");
+		/* effacement, collage, recherche sans résultat */
+		for (k = 0; k < 40; k++) core_key(K_BACKSPACE, 0);
+		snprintf(paste_buf, sizeof paste_buf, "zzz introuvable\nligne 2");
+		core_key('V', LMOD_CTRL);
+		t0 = platform_time();
+		do { core_poll(); core_draw(); core_find_info(&tot, &rk, &pend, &pg); wait_wake(0.02); }
+		while (pend && platform_time() - t0 < 60);
+		printf("collage [zzz introuvable] : %d résultats, %d pages en attente\n", tot, pend);
+		save("f04_aucun.png");
+		core_key(K_ESC, 0);
+		core_find_info(&tot, &rk, &pend, &pg);
+		printf("Échap : recherche fermée (%d résultats affichés)\n", tot);
+		/* F3 barre fermée : rouvre et relance la dernière recherche */
+		for (k = 0; k < 40; k++) core_key(K_BACKSPACE, 0);
+		core_key('F', LMOD_CTRL);
+		for (k = 0; k < 40; k++) core_key(K_BACKSPACE, 0);
+		for (c = q1; *c; c++) core_char((unsigned char)*c);
+		core_key(K_ESC, 0);
+		core_key(K_F3, 0);
+		t0 = platform_time();
+		do { core_poll(); core_draw(); core_find_info(&tot, &rk, &pend, &pg); wait_wake(0.02); }
+		while ((pend || rk == 0) && tot >= 0 && platform_time() - t0 < 60 && !(tot == 0 && !pend));
+		printf("F3 barre fermée : %d résultats, courant %d (page %d)\n", tot, rk, pg + 1);
+		/* changement de mode d'affichage pendant la recherche (barre ouverte : 'd' irait dans le champ) */
+		core_key(K_ESC, 0);
+		core_char('d');
+		core_key(K_F3, 0);
+		for (k = 0; k < 5; k++) core_key(K_ENTER, 0);
+		pump("  deux pages + F3 + 5 x Entrée", 120);
+		core_find_info(&tot, &rk, &pend, &pg);
+		printf("  deux pages : courant %d / %d (page %d), page affichée %d\n", rk, tot, pg + 1, core_current_page() + 1);
+		save("f05_deux_pages.png");
+		/* rotation (barre ouverte : Ctrl+Maj++) : les surlignages suivent */
+		core_key(K_PLUS, LMOD_CTRL | LMOD_SHIFT);
+		core_key(K_ENTER, 0);
+		pump("  rotation 90 + Entrée", 120);
+		save("f07_rotation.png");
+		core_key(K_MINUS, LMOD_CTRL | LMOD_SHIFT);
+		/* boutons de la barre (souris) : survol, suivant x2, précédent, fermer */
+		t0 = platform_time();
+		do { core_poll(); core_draw(); core_find_info(&tot, &rk, &pend, &pg); wait_wake(0.02); }
+		while (pend && platform_time() - t0 < 60);
+		{
+			int by = 34 + 8 + 16, bn = W - 12 - 16 - 50, bp = W - 12 - 16 - 85, bc = W - 12 - 16 - 15;
+			core_find_info(&tot, &rk, &pend, &pg);
+			printf("  avant les boutons : courant %d / %d\n", rk, tot);
+			core_mouse_move(bn, by, 0);
+			save("f06_survol_suivant.png");
+			core_mouse_down(BTN_LEFT, bn, by, 0); core_mouse_up(BTN_LEFT, bn, by, 0);
+			core_mouse_down(BTN_LEFT, bn, by, 0); core_mouse_up(BTN_LEFT, bn, by, 0);
+			core_find_info(&tot, &rk, &pend, &pg);
+			printf("  bouton suivant x2 : courant %d / %d\n", rk, tot);
+			core_mouse_down(BTN_LEFT, bp, by, 0); core_mouse_up(BTN_LEFT, bp, by, 0);
+			core_find_info(&tot, &rk, &pend, &pg);
+			printf("  bouton précédent : courant %d / %d\n", rk, tot);
+			core_mouse_down(BTN_LEFT, bc, by, 0); core_mouse_up(BTN_LEFT, bc, by, 0);
+			printf("  bouton fermer : mode de saisie %d (0 attendu)\n", core_input_mode());
+		}
+		core_key(K_ESC, 0);
+		core_char('d');
 		core_shutdown();
 		printf("textures restantes : %ld octets\n", soft_tex_bytes);
 		return 0;
