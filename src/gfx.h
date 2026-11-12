@@ -7,6 +7,8 @@ int  gfx_max_texture(void);          /* taille max d'une texture (px) */
 
 /* Crée une texture à partir de pixels BGRA (prémultipliés). */
 void *gfx_tex_create(int w, int h, const unsigned char *bgra, int stride);
+/* Texture en niveaux de gris (1 octet par pixel, lignes de w octets) : 4 fois moins de mémoire. */
+void *gfx_tex_create_gray(int w, int h, const unsigned char *gray);
 void gfx_tex_free(void *tex);
 
 void gfx_begin(int w, int h, unsigned rgb);      /* début d'image, efface le fond */

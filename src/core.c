@@ -29,6 +29,9 @@
 #include <mupdf/fitz.h>
 #include <mupdf/ucdn.h>
 #include <mupdf/pdf.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 #include <ctype.h>
 #include <limits.h>
@@ -52,6 +55,8 @@
 
 enum { L_NONE, L_QUEUED, L_BUILDING, L_READY, L_ERROR };
 enum { J_IDLE, J_QUEUED, J_RUNNING, J_DONE, J_READY, J_FAILED };
+/* forme compacte d'une tuile calculée : unie (aucun pixel gardé), niveaux de gris ou couleur, compressée ou non */
+enum { PK_NONE, PK_FLAT, PK_GRAY, PK_GRAY_RAW, PK_COLOR, PK_COLOR_RAW };
 enum { FIT_NONE, FIT_PAGE, FIT_WIDTH };
 enum { DRAG_NONE, DRAG_PAN, DRAG_ZOOM, DRAG_VBAR, DRAG_HBAR, DRAG_AUTO, DRAG_SELECT };
 enum { HIT_NONE = 0, HIT_PLUS, HIT_OPENWITH, HIT_VIEW, HIT_ROT_CCW, HIT_ROT_CW, HIT_TAB = 100000, HIT_CLOSE = 200000 };
@@ -68,9 +73,17 @@ struct Job {
 	fz_irect rect;          /* rectangle en pixels dans l'espace du niveau */
 	fz_matrix ctm;
 	double scale;
-	fz_pixmap *pix;         /* résultat en attente d'envoi à la carte graphique */
+	/* Une tuile calculée est gardée compressée en mémoire ; elle n'a de texture que
+	   lorsqu'elle est à l'écran ou sur le point d'y être (voir promote). */
+	unsigned char *pk;      /* pixels compressés (NULL pour une tuile unie) */
+	size_t pk_bytes;
+	int fmt;                /* PK_* */
+	unsigned flat;          /* couleur ARGB d'une tuile unie */
 	void *tex;
-	size_t bytes;
+	int notex;              /* la carte graphique a refusé la texture */
+	unsigned tex_frame;     /* dernière image où la texture a servi */
+	Job *tnext, *tprev;     /* textures, de la plus récemment utilisée à la plus ancienne */
+	size_t bytes;           /* taille nominale (largeur x hauteur x 4) : unité des budgets */
 	unsigned used;          /* dernière génération de planification où il était utile */
 	unsigned vis_gen;       /* dernière génération où il était à l'écran */
 	double key;             /* priorité (plus petit = plus urgent) */
@@ -118,7 +131,7 @@ struct Tab {
 	double max_page_dim;
 	Job *htab[HASH_SIZE];
 	int njobs;
-	size_t tex_bytes;
+	size_t tex_bytes;                  /* tuiles calculées, en taille nominale (budget d'anticipation) */
 	int level, min_level, max_level;
 	double scale;
 	int rot;
@@ -155,7 +168,9 @@ static int quit, paused;
 static int nrunning, loader_busy[MAX_LOADERS], loader_page[MAX_LOADERS], resched;
 static Tab *loader_tab[MAX_LOADERS];
 static Job *running[MAX_WORKERS];
-static size_t tex_budget = (size_t)384 << 20;   /* mémoire graphique des tuiles (onglet actif) */
+static size_t tex_budget = (size_t)384 << 20;   /* tuiles calculées gardées (onglet actif), en taille nominale */
+static size_t gpu_budget = (size_t)160 << 20;   /* textures envoyées à la carte graphique, en taille nominale */
+static size_t gpu_budget_fixed;                 /* imposé par LIRE_GPU_MB (tests) */
 static size_t list_budget = (size_t)512 << 20;  /* mémoire des pages analysées (onglet actif) */
 static JobVec wq, wq_next;
 static int wq_pos;
@@ -179,7 +194,14 @@ static int gap = 10, sbw = 12;
 static int view_dirty, need_schedule, dirty = 1;
 static int wheel_zoom;
 static int view_default = VIEW_CONTINUOUS;   /* mode d'affichage des prochains fichiers ouverts */
-static size_t tex_total;
+static size_t tex_total;            /* tuiles calculées de tous les onglets, taille nominale */
+static size_t pk_total;             /* mémoire réellement occupée par ces tuiles (compressées) */
+static size_t gpu_bytes, gpu_real;  /* textures : taille nominale (budget) et réelle */
+static Job *lru_head, *lru_tail;
+static unsigned frame_id;
+static double promo_deadline;       /* fin de la tranche d'envoi de textures de l'image en cours */
+static int promo_count, promo_more, promo_force;
+static long st_wait_render, st_wait_tex, st_promos;   /* mesures : tuiles visibles en attente de rendu / de texture */
 
 /* interaction */
 static int drag, drag_btn, mx0, my0, mx, my;
@@ -314,17 +336,57 @@ static void ready_remove(Page *p, Job *j)
 }
 
 /* Libère un job qui n'est ni en file, ni en cours, ni en attente d'envoi. */
+/* ---------- textures : seulement pour ce qui est (presque) à l'écran ---------- */
+
+static int drawable(const Job *j) { return j->tex != NULL || j->fmt == PK_FLAT; }
+static size_t tex_real_bytes(const Job *j) { return j->fmt == PK_GRAY || j->fmt == PK_GRAY_RAW ? j->bytes / 4 : j->bytes; }
+
+static void lru_unlink(Job *j)
+{
+	if (j->tprev) j->tprev->tnext = j->tnext; else lru_head = j->tnext;
+	if (j->tnext) j->tnext->tprev = j->tprev; else lru_tail = j->tprev;
+	j->tnext = j->tprev = NULL;
+}
+
+static void lru_front(Job *j)
+{
+	j->tprev = NULL;
+	j->tnext = lru_head;
+	if (lru_head) lru_head->tprev = j; else lru_tail = j;
+	lru_head = j;
+}
+
+/* la texture vient de servir (ou doit rester prête) */
+static void tex_touch(Job *j)
+{
+	j->tex_frame = frame_id;
+	if (lru_head != j) { lru_unlink(j); lru_front(j); }
+}
+
+/* rend la texture à la carte graphique ; la tuile reste en mémoire, compressée */
+static void demote(Job *j)
+{
+	if (!j->tex) return;
+	gfx_tex_free(j->tex);
+	j->tex = NULL;
+	lru_unlink(j);
+	gpu_bytes -= j->bytes;
+	gpu_real -= tex_real_bytes(j);
+}
+
+/* Libère un job qui n'est ni en file, ni en cours, ni en attente d'enregistrement. */
 static void job_free(Job *j)
 {
 	Tab *t = j->tab;
 	hremove(j);
-	if (j->tex) {
+	demote(j);
+	if (j->state == J_READY) {
 		ready_remove(&t->pages[j->page], j);
-		gfx_tex_free(j->tex);
 		t->tex_bytes -= j->bytes;
 		tex_total -= j->bytes;
+		pk_total -= j->pk_bytes;
 	}
-	if (j->pix) fz_drop_pixmap(ctx, j->pix);
+	free(j->pk);
 	free(j);
 }
 
@@ -395,6 +457,312 @@ static fz_pixmap *render_job(fz_context *c, Job *j, fz_display_list *list)
 	return pix;
 }
 
+/* ---------- compression des tuiles ----------
+   Un plan est fait de traits sur fond blanc : presque toutes les tuiles sont en niveaux
+   de gris, beaucoup sont entièrement blanches, et le reste contient de longues plages
+   unies. Format : suite de blocs [type 1 octet][longueur 3 octets][données] ;
+   type 0 = « longueur » éléments recopiés tels quels, type 1 = un élément répété
+   « longueur » fois. Élément = 1 octet (gris) ou 4 octets (couleur BGRA).
+   Seules les plages d'au moins 8 octets sont cherchées, mot par mot : la compression
+   coûte une fraction du temps de rendu, la décompression n'est que memcpy / memset. */
+
+typedef struct { unsigned char *data; size_t n; int fmt; unsigned flat; } Packed;
+
+#define RLE_MAX 0xffffff
+
+static size_t rle_block(unsigned char *d, size_t o, int type, size_t len)
+{
+	d[o] = (unsigned char)type;
+	d[o + 1] = (unsigned char)len;
+	d[o + 2] = (unsigned char)(len >> 8);
+	d[o + 3] = (unsigned char)(len >> 16);
+	return o + 4;
+}
+
+/* gris : renvoie la taille compressée, 0 si elle dépasserait cap (n <= RLE_MAX) */
+static size_t rle8(const unsigned char *s, size_t n, unsigned char *d, size_t cap)
+{
+	size_t i = 0, o = 0, lit = 0;   /* lit : début des octets pas encore écrits */
+	while (i + 8 <= n) {
+		uint64_t w;
+		memcpy(&w, s + i, 8);
+		if (w != ((w << 8) | (w >> 56))) { i += 8; continue; }   /* les 8 octets ne sont pas identiques */
+		{
+			unsigned char v = s[i];
+			size_t a = i, e = i + 8;
+			while (a > lit && s[a - 1] == v) a--;
+			while (e + 8 <= n) {
+				uint64_t x;
+				memcpy(&x, s + e, 8);
+				if (x != w) break;
+				e += 8;
+			}
+			while (e < n && s[e] == v) e++;
+			if (a > lit) {
+				if (o + 4 + (a - lit) > cap) return 0;
+				o = rle_block(d, o, 0, a - lit);
+				memcpy(d + o, s + lit, a - lit);
+				o += a - lit;
+			}
+			if (o + 5 > cap) return 0;
+			o = rle_block(d, o, 1, e - a);
+			d[o++] = v;
+			i = lit = e;
+		}
+	}
+	if (lit < n) {
+		if (o + 4 + (n - lit) > cap) return 0;
+		o = rle_block(d, o, 0, n - lit);
+		memcpy(d + o, s + lit, n - lit);
+		o += n - lit;
+	}
+	return o;
+}
+
+static int unrle8(const unsigned char *s, size_t n, unsigned char *d, size_t dn)
+{
+	size_t i = 0, o = 0;
+	while (i + 4 <= n) {
+		int type = s[i];
+		size_t len = s[i + 1] | (size_t)s[i + 2] << 8 | (size_t)s[i + 3] << 16;
+		i += 4;
+		if (o + len > dn) return 0;
+		if (type == 0) {
+			if (i + len > n) return 0;
+			memcpy(d + o, s + i, len);
+			i += len;
+		} else {
+			if (i >= n) return 0;
+			memset(d + o, s[i++], len);
+		}
+		o += len;
+	}
+	return i == n && o == dn;
+}
+
+/* couleur : plages d'au moins 4 pixels identiques */
+static size_t rle32(const uint32_t *s, size_t n, unsigned char *d, size_t cap)
+{
+	size_t i = 0, o = 0, lit = 0;
+	while (i + 4 <= n) {
+		uint32_t v = s[i];
+		size_t e;
+		if (s[i + 1] != v || s[i + 2] != v || s[i + 3] != v) { i++; continue; }
+		e = i + 4;
+		while (e < n && s[e] == v) e++;
+		if (i > lit) {
+			if (o + 4 + (i - lit) * 4 > cap) return 0;
+			o = rle_block(d, o, 0, i - lit);
+			memcpy(d + o, s + lit, (i - lit) * 4);
+			o += (i - lit) * 4;
+		}
+		if (o + 8 > cap) return 0;
+		o = rle_block(d, o, 1, e - i);
+		memcpy(d + o, &v, 4);
+		o += 4;
+		i = lit = e;
+	}
+	if (lit < n) {
+		if (o + 4 + (n - lit) * 4 > cap) return 0;
+		o = rle_block(d, o, 0, n - lit);
+		memcpy(d + o, s + lit, (n - lit) * 4);
+		o += (n - lit) * 4;
+	}
+	return o;
+}
+
+static int unrle32(const unsigned char *s, size_t n, uint32_t *d, size_t dn)
+{
+	size_t i = 0, o = 0, k;
+	while (i + 4 <= n) {
+		int type = s[i];
+		size_t len = s[i + 1] | (size_t)s[i + 2] << 8 | (size_t)s[i + 3] << 16;
+		i += 4;
+		if (o + len > dn) return 0;
+		if (type == 0) {
+			if (i + len * 4 > n) return 0;
+			memcpy(d + o, s + i, len * 4);
+			i += len * 4;
+		} else {
+			uint32_t v;
+			if (i + 4 > n) return 0;
+			memcpy(&v, s + i, 4);
+			i += 4;
+			for (k = 0; k < len; k++) d[o + k] = v;
+		}
+		o += len;
+	}
+	return i == n && o == dn;
+}
+
+/* Une ligne BGRA -> plan gris (octet B), en notant au passage si un pixel n'est pas
+   gris (ng, 16 bits de poids faible) ou diffère du premier pixel de la tuile (nu). */
+static void gray_row(const unsigned char *row, unsigned char *gd, int w, uint32_t first, uint32_t *ng, uint32_t *nu)
+{
+	int x = 0;
+	uint32_t g = 0, u = 0;
+#ifdef __SSE2__
+	__m128i f = _mm_set1_epi32((int)first), mask = _mm_set1_epi32(0xff), vg = _mm_setzero_si128(), vu = _mm_setzero_si128();
+	uint32_t lanes[4];
+	for (; x + 16 <= w; x += 16) {
+		__m128i a = _mm_loadu_si128((const __m128i *)(row + x * 4));
+		__m128i b = _mm_loadu_si128((const __m128i *)(row + x * 4 + 16));
+		__m128i c = _mm_loadu_si128((const __m128i *)(row + x * 4 + 32));
+		__m128i d = _mm_loadu_si128((const __m128i *)(row + x * 4 + 48));
+		vg = _mm_or_si128(vg, _mm_or_si128(_mm_xor_si128(a, _mm_srli_epi32(a, 8)), _mm_xor_si128(b, _mm_srli_epi32(b, 8))));
+		vg = _mm_or_si128(vg, _mm_or_si128(_mm_xor_si128(c, _mm_srli_epi32(c, 8)), _mm_xor_si128(d, _mm_srli_epi32(d, 8))));
+		vu = _mm_or_si128(vu, _mm_or_si128(_mm_xor_si128(a, f), _mm_xor_si128(b, f)));
+		vu = _mm_or_si128(vu, _mm_or_si128(_mm_xor_si128(c, f), _mm_xor_si128(d, f)));
+		_mm_storeu_si128((__m128i *)(gd + x), _mm_packus_epi16(
+			_mm_packs_epi32(_mm_and_si128(a, mask), _mm_and_si128(b, mask)),
+			_mm_packs_epi32(_mm_and_si128(c, mask), _mm_and_si128(d, mask))));
+	}
+	_mm_storeu_si128((__m128i *)lanes, vg);
+	g = lanes[0] | lanes[1] | lanes[2] | lanes[3];
+	_mm_storeu_si128((__m128i *)lanes, vu);
+	u = lanes[0] | lanes[1] | lanes[2] | lanes[3];
+#endif
+	for (; x < w; x++) {
+		uint32_t v;
+		memcpy(&v, row + x * 4, 4);
+		g |= v ^ (v >> 8);
+		u |= v ^ first;
+		gd[x] = (unsigned char)v;
+	}
+	*ng |= g & 0xffff;
+	*nu |= u;
+}
+
+typedef struct { unsigned char *g, *o; size_t cap; } PackScratch;   /* tampons de travail d'un thread de rendu */
+
+/* (thread de rendu) compresse une tuile BGRA opaque fraîchement calculée ; 0 si mémoire insuffisante */
+static int pack_pixmap(fz_context *c, fz_pixmap *pix, Packed *out, PackScratch *sc)
+{
+	int w = fz_pixmap_width(c, pix), h = fz_pixmap_height(c, pix), y;
+	ptrdiff_t stride = fz_pixmap_stride(c, pix);
+	const unsigned char *sp = fz_pixmap_samples(c, pix);
+	size_t n = (size_t)w * h, m;
+	uint32_t first, notgray = 0, notuni = 0;
+	unsigned char *o;
+	memset(out, 0, sizeof *out);
+	if (w <= 0 || h <= 0 || n > RLE_MAX || fz_pixmap_components(c, pix) != 4) return 0;
+	if (sc->cap < n) {
+		free(sc->g); free(sc->o);
+		sc->g = malloc(n); sc->o = malloc(n);
+		sc->cap = sc->g && sc->o ? n : 0;
+		if (!sc->cap) { free(sc->g); free(sc->o); sc->g = sc->o = NULL; return 0; }
+	}
+	memcpy(&first, sp, 4);
+	/* niveaux de gris (B = V = R partout) ? unie ? — on extrait le plan gris au passage */
+	for (y = 0; y < h && !notgray; y++)
+		gray_row(sp + y * stride, sc->g + (size_t)y * w, w, first, &notgray, &notuni);
+	if (!notgray && !notuni) {
+		out->fmt = PK_FLAT;
+		out->flat = 0xff000000u | (first & 0xffffff);
+		return 1;
+	}
+	if (!notgray) {
+		m = rle8(sc->g, n, sc->o, n);
+		if (m && m < n) {
+			out->data = malloc(m);
+			if (!out->data) return 0;
+			memcpy(out->data, sc->o, m);
+			out->n = m;
+			out->fmt = PK_GRAY;
+		} else {
+			out->data = malloc(n);
+			if (!out->data) return 0;
+			memcpy(out->data, sc->g, n);
+			out->n = n;
+			out->fmt = PK_GRAY_RAW;
+		}
+		return 1;
+	}
+	/* couleur : pixels BGRA contigus, puis plages de pixels identiques */
+	{
+		uint32_t *px = malloc(n * 4);
+		int uni = 1;
+		if (!px) return 0;
+		for (y = 0; y < h; y++) memcpy(px + (size_t)y * w, sp + y * stride, (size_t)w * 4);
+		for (m = 1; m < n && uni; m++) if (px[m] != first) uni = 0;
+		if (uni) {
+			free(px);
+			out->fmt = PK_FLAT;
+			out->flat = 0xff000000u | (first & 0xffffff);
+			return 1;
+		}
+		o = malloc(n * 4);
+		m = o ? rle32(px, n, o, n * 4) : 0;
+		if (m) {
+			unsigned char *sh = realloc(o, m);
+			free(px);
+			out->data = sh ? sh : o;
+			out->n = m;
+			out->fmt = PK_COLOR;
+		} else {
+			free(o);
+			out->data = (unsigned char *)px;
+			out->n = n * 4;
+			out->fmt = PK_COLOR_RAW;
+		}
+	}
+	return 1;
+}
+
+/* (thread principal) crée la texture d'une tuile calculée. force : sans limite de temps.
+   Renvoie 1 si la tuile peut être dessinée. */
+static int promote(Job *j, int force)
+{
+	static unsigned char *buf;
+	static size_t cap;
+	int w = j->rect.x1 - j->rect.x0, h = j->rect.y1 - j->rect.y0, gray;
+	size_t n = (size_t)w * h;
+	const unsigned char *src;
+	if (j->tex) { tex_touch(j); return 1; }
+	if (j->fmt == PK_FLAT) return 1;
+	if (j->notex || !j->pk) return 0;
+	/* tranche de temps par image, pour ne jamais bloquer l'interface (au moins une texture par image) */
+	if (!force && promo_force <= 0 && promo_count > 0 && platform_time() > promo_deadline) { promo_more = 1; return 0; }
+	gray = j->fmt == PK_GRAY || j->fmt == PK_GRAY_RAW;
+	src = j->pk;
+	if (j->fmt == PK_GRAY || j->fmt == PK_COLOR) {
+		size_t need = gray ? n : n * 4;
+		if (cap < need) { cap = need; free(buf); buf = malloc(cap); }
+		if (!buf) { cap = 0; j->notex = 1; return 0; }
+		if (!(gray ? unrle8(j->pk, j->pk_bytes, buf, n) : unrle32(j->pk, j->pk_bytes, (uint32_t *)buf, n))) { j->notex = 1; return 0; }
+		src = buf;
+	}
+	j->tex = gray ? gfx_tex_create_gray(w, h, src) : gfx_tex_create(w, h, src, w * 4);
+	promo_count++;
+	st_promos++;
+	if (!j->tex) { j->notex = 1; return 0; }
+	lru_front(j);
+	j->tex_frame = frame_id;
+	gpu_bytes += j->bytes;
+	gpu_real += tex_real_bytes(j);
+	return 1;
+}
+
+/* Budget de textures : ce qu'il faut pour l'écran, sa couronne et la zone visible aux
+   deux crans de zoom voisins (voir warm_textures), plus une marge. Il dépend donc de la
+   taille de la fenêtre, pas de la mémoire du PC. */
+static void gpu_budget_update(void)
+{
+	double tw = (double)vw / TILE, th = (double)vh / TILE;
+	double n = (tw + 4) * (th + 4) + 2.6 * (tw + 2) * (th + 2);
+	if (gpu_budget_fixed) { gpu_budget = gpu_budget_fixed; return; }
+	gpu_budget = (size_t)(clampd(n * 1.25, 96, 768) * TILE_BYTES);
+}
+
+/* fin d'image : au-delà du budget, on rend les textures les plus anciennes (jamais celles de l'image) */
+static void gpu_trim(void)
+{
+	gpu_budget_update();
+	while (gpu_bytes > gpu_budget && lru_tail && lru_tail->tex_frame != frame_id) demote(lru_tail);
+}
+
+static PackScratch pscratch[MAX_WORKERS];
+
 static void worker_main(void *arg)
 {
 	int id = (int)(intptr_t)arg;
@@ -405,7 +773,8 @@ static void worker_main(void *arg)
 		Page *p;
 		fz_display_list *list;
 		fz_pixmap *pix;
-		int wake = 0;
+		Packed pk;
+		int wake = 0, ok = 0;
 		if (!paused)
 			while (wq_pos < wq.n) {
 				Job *k = wq.v[wq_pos++];
@@ -423,22 +792,29 @@ static void worker_main(void *arg)
 
 		pix = render_job(c, j, list);
 		fz_drop_display_list(c, list);
+		/* compressée tout de suite : l'image brute (1 Mo) ne vit que le temps du rendu */
+		memset(&pk, 0, sizeof pk);
+		if (pix && !j->cookie.abort) ok = pack_pixmap(c, pix, &pk, &pscratch[id]);
+		fz_drop_pixmap(c, pix);
 
 		mutex_lock(&mu);
 		running[id] = NULL;
 		nrunning--;
 		if (j->dropped) {
-			fz_drop_pixmap(c, pix);
+			free(pk.data);
 			free(j);
 		} else if (j->cookie.abort) {
-			fz_drop_pixmap(c, pix);
+			free(pk.data);
 			j->state = J_IDLE;
 			resched = 1; wake = 1;
-		} else if (!pix) {
+		} else if (!ok) {
 			j->state = J_FAILED;
 			wake = 1;
 		} else {
-			j->pix = pix;
+			j->pk = pk.data;
+			j->pk_bytes = pk.n;
+			j->fmt = pk.fmt;
+			j->flat = pk.flat;
 			j->state = J_DONE;
 			j->dnext = done_head;
 			done_head = j;
@@ -785,8 +1161,9 @@ static void flush_jobs(Tab *t)
 				j->dropped = 1;
 				j->cookie.abort = 1;
 			} else {
-				if (j->tex) { gfx_tex_free(j->tex); tex_total -= j->bytes; }
-				if (j->pix) fz_drop_pixmap(ctx, j->pix);
+				demote(j);
+				if (j->state == J_READY) { tex_total -= j->bytes; pk_total -= j->pk_bytes; }
+				free(j->pk);
 				free(j);
 			}
 			j = next;
@@ -2094,7 +2471,6 @@ int core_poll(void)
 {
 	Job *list;
 	int changed = 0, relayout = 0, k, ti;
-	double t0 = platform_time();
 	mutex_lock(&mu);
 	if (resched) {
 		resched = 0; need_schedule = 1; changed = 1;
@@ -2114,50 +2490,26 @@ int core_poll(void)
 	done_head = NULL;
 	mutex_unlock(&mu);
 	if (relayout) sync_view();
-	/* les tuiles à l'écran d'abord, l'anticipation ensuite */
-	if (list && list->dnext) {
-		static JobVec dv;
-		Job *j;
-		dv.n = 0;
-		for (j = list; j; j = j->dnext) jv_push(&dv, j);
-		qsort(dv.v, dv.n, sizeof *dv.v, cmp_key);
-		for (k = 0; k < dv.n; k++) dv.v[k]->dnext = k + 1 < dv.n ? dv.v[k + 1] : NULL;
-		list = dv.v[0];
-	}
+	/* Enregistrement des tuiles calculées. Rien n'est envoyé à la carte graphique ici :
+	   c'est fait à l'affichage, pour les seules tuiles à l'écran (promote). */
 	while (list) {
 		Job *j = list;
 		list = j->dnext;
 		j->dnext = NULL;
 		if (j->dropped) {
-			fz_drop_pixmap(ctx, j->pix);
+			free(j->pk);
 			free(j);
 			continue;
 		}
-		j->tex = gfx_tex_create(fz_pixmap_width(ctx, j->pix), fz_pixmap_height(ctx, j->pix),
-				fz_pixmap_samples(ctx, j->pix), (int)fz_pixmap_stride(ctx, j->pix));
-		j->bytes = (size_t)fz_pixmap_width(ctx, j->pix) * fz_pixmap_height(ctx, j->pix) * 4;
-		fz_drop_pixmap(ctx, j->pix);
-		j->pix = NULL;
+		j->bytes = (size_t)(j->rect.x1 - j->rect.x0) * (j->rect.y1 - j->rect.y0) * 4;
 		mutex_lock(&mu);
-		j->state = j->tex ? J_READY : J_FAILED;
+		j->state = J_READY;
 		mutex_unlock(&mu);
-		if (j->tex) {
-			j->tab->tex_bytes += j->bytes;
-			tex_total += j->bytes;
-			ready_add(&j->tab->pages[j->page], j);
-		}
+		j->tab->tex_bytes += j->bytes;
+		tex_total += j->bytes;
+		pk_total += j->pk_bytes;
+		ready_add(&j->tab->pages[j->page], j);
 		changed = 1;
-		/* on limite le temps passé à envoyer des textures pour garder l'interface fluide */
-		if (list && platform_time() - t0 > 0.006) {
-			Job *tail = list;
-			while (tail->dnext) tail = tail->dnext;
-			mutex_lock(&mu);
-			tail->dnext = done_head;
-			done_head = list;
-			mutex_unlock(&mu);
-			platform_wake();
-			break;
-		}
 	}
 	if (changed) dirty = 1;
 	return changed;
@@ -2194,6 +2546,7 @@ int core_view_complete(void)
 			for (tx = a0; tx <= a1; tx++) {
 				Job *j = hfind(T, i, R, tx, ty);
 				if (!j || (j->state != J_READY && j->state != J_FAILED)) return 0;
+				if (j->state == J_READY && !drawable(j) && !j->notex) return 0;   /* texture pas encore envoyée */
 			}
 	}
 	return 1;
@@ -2749,24 +3102,32 @@ static int cmp_fallback(const void *a, const void *b)
 }
 
 /* dessine une tuile (de n'importe quel niveau) à sa place à l'écran */
+static int tile_rect(Tab *t, Page *p, Job *f, float X, float Y, float *x0, float *y0, float *x1, float *y1)
+{
+	if (f->level == PREVIEW_LEVEL) {
+		*x0 = X; *y0 = Y; *x1 = X + p->pw; *y1 = Y + p->ph;
+	} else if (f->level == t->level) {   /* niveau affiché : au pixel près */
+		*x0 = X + (f->rect.x0 - p->pbox.x0);
+		*y0 = Y + (f->rect.y0 - p->pbox.y0);
+		*x1 = *x0 + (f->rect.x1 - f->rect.x0);
+		*y1 = *y0 + (f->rect.y1 - f->rect.y0);
+	} else {                             /* autre niveau : la carte graphique met à l'échelle */
+		double r = t->scale / f->scale;
+		*x0 = X + (float)(f->rect.x0 * r - p->pbox.x0);
+		*y0 = Y + (float)(f->rect.y0 * r - p->pbox.y0);
+		*x1 = X + (float)(f->rect.x1 * r - p->pbox.x0);
+		*y1 = Y + (float)(f->rect.y1 * r - p->pbox.y0);
+	}
+	return !(*x1 < 0 || *y1 < 0 || *x0 > vw || *y0 > vh);
+}
+
 static void draw_tile(Tab *t, Page *p, Job *f, float X, float Y)
 {
 	float x0, y0, x1, y1;
-	if (f->level == PREVIEW_LEVEL) {
-		x0 = X; y0 = Y; x1 = X + p->pw; y1 = Y + p->ph;
-	} else if (f->level == t->level) {   /* niveau affiché : au pixel près */
-		x0 = X + (f->rect.x0 - p->pbox.x0);
-		y0 = Y + (f->rect.y0 - p->pbox.y0);
-		x1 = x0 + (f->rect.x1 - f->rect.x0);
-		y1 = y0 + (f->rect.y1 - f->rect.y0);
-	} else {                             /* autre niveau : la carte graphique met à l'échelle */
-		double r = t->scale / f->scale;
-		x0 = X + (float)(f->rect.x0 * r - p->pbox.x0);
-		y0 = Y + (float)(f->rect.y0 * r - p->pbox.y0);
-		x1 = X + (float)(f->rect.x1 * r - p->pbox.x0);
-		y1 = Y + (float)(f->rect.y1 * r - p->pbox.y0);
-	}
-	if (x1 < 0 || y1 < 0 || x0 > vw || y0 > vh) return;
+	if (!tile_rect(t, p, f, X, Y, &x0, &y0, &x1, &y1)) return;
+	if (f->fmt == PK_FLAT) { gfx_rect(x0, y0, x1, y1, f->flat); return; }   /* tuile unie : pas de texture */
+	if (!f->tex) return;
+	tex_touch(f);
 	gfx_image(f->tex, 0, 0, (float)(f->rect.x1 - f->rect.x0), (float)(f->rect.y1 - f->rect.y0), x0, y0, x1, y1, 0);
 }
 
@@ -2785,30 +3146,39 @@ static void draw_pages(void)
 		gfx_rect(X - 1, Y - 1, X + p->pw + 1, Y + p->ph + 1, 0xff1e2023);
 		gfx_rect(X, Y, X + p->pw, Y + p->ph, 0xffffffff);
 		if (!tiles_for(t, p, R, 0, 0, &a0, &b0, &a1, &b1)) continue;
-		for (ty = b0; ty <= b1 && complete; ty++)
+		/* les tuiles visibles déjà calculées reçoivent leur texture maintenant */
+		for (ty = b0; ty <= b1; ty++)
 			for (tx = a0; tx <= a1; tx++) {
 				Job *j = hfind(t, i, R, tx, ty);
-				if (!j || j->state != J_READY) { complete = 0; break; }
+				if (!j || j->state != J_READY) { complete = 0; st_wait_render++; }
+				else if (!promote(j, 0)) { complete = 0; st_wait_tex++; }
 			}
 		if (!complete) {
 			/* repli : aperçu et tuiles d'autres niveaux, étirés par la carte graphique,
 			   du plus éloigné au plus proche du niveau voulu (le plus fidèle par-dessus) */
-			int n = 0, k;
+			int n = 0, k, best = INT_MAX, bestL = 0;
+			float x0, y0, x1, y1;
 			Job *j;
 			for (j = p->ready; j; j = j->pnext) {
-				if (j->level == R) continue;
+				if (j->level == R || !tile_rect(t, p, j, X, Y, &x0, &y0, &x1, &y1)) continue;
+				if (j->level == PREVIEW_LEVEL) promote(j, 1);
+				else if (!drawable(j) && !j->notex && abs(j->level - R) < best) { best = abs(j->level - R); bestL = j->level; }
 				if (n == fbcap) { fbcap = fbcap ? fbcap * 2 : 64; fb = realloc(fb, fbcap * sizeof *fb); }
 				fb[n++] = j;
 			}
+			/* tuiles calculées du niveau le plus proche, pas encore en texture : envoyées s'il reste du temps */
+			if (best != INT_MAX)
+				for (k = 0; k < n; k++)
+					if (fb[k]->level == bestL && !fb[k]->notex && !promote(fb[k], 0)) break;
 			fb_R = R;
 			if (n > 1) qsort(fb, n, sizeof *fb, cmp_fallback);
-			for (k = 0; k < n; k++) draw_tile(t, p, fb[k], X, Y);
-			drawn = n > 0;
+			for (k = 0; k < n; k++)
+				if (drawable(fb[k])) { draw_tile(t, p, fb[k], X, Y); drawn = 1; }
 		}
 		for (ty = b0; ty <= b1; ty++)
 			for (tx = a0; tx <= a1; tx++) {
 				Job *j = hfind(t, i, R, tx, ty);
-				if (j && j->state == J_READY) {
+				if (j && j->state == J_READY && drawable(j)) {
 					draw_tile(t, p, j, X, Y);
 					drawn = 1;
 				}
@@ -2908,8 +3278,14 @@ static void draw_help(void)
 		if (a > w0) w0 = a;
 		if (b > w1) w1 = b;
 	}
+	char memline[200];
+	size_t lists = 0;
+	for (i = 0; i < ntabs; i++) lists += tabs[i]->list_bytes;
+	/* où part la mémoire (utile pour un diagnostic sans avoir à transmettre le fichier) */
+	snprintf(memline, sizeof memline, "M\xc3\xa9moire \xe2\x80\x94 images calcul\xc3\xa9""es : %.0f Mo  \xc2\xb7  textures : %.0f Mo  \xc2\xb7  pages analys\xc3\xa9""es : %.0f Mo",
+			pk_total / 1048576.0, gpu_real / 1048576.0, lists / 1048576.0);
 	w = (float)(w0 + w1 + 3 * pad);
-	h = (float)(n * lh + 2 * pad + title * 2);
+	h = (float)(n * lh + 2 * pad + title * 2 + lh);
 	x0 = floorf((vw - w) / 2);
 	y0 = fmaxf(4, floorf((vh - h) / 2));
 	gfx_rect(0, 0, (float)vw, (float)vh, 0x60000000);
@@ -2921,6 +3297,7 @@ static void draw_help(void)
 		draw_text(help_lines[i][0], px, 0, x0 + pad, y, 0xffc9ccd1);
 		draw_text(help_lines[i][1], px, 1, x0 + 2 * pad + w0, y, 0xffffffff);
 	}
+	draw_text(memline, px - 1, 0, x0 + pad, y0 + pad + title * 2 + n * lh + lh * 0.35f, 0xff8a9099);
 }
 
 /* trait épais quelconque (icônes vectorielles simples) */
@@ -3132,8 +3509,43 @@ static void autoscroll_step(void)
 	view_dirty = 1;
 }
 
+/* Garde prêtes, en textures, les tuiles déjà calculées dont on aura besoin au prochain
+   geste : la couronne autour de l'écran, et la zone visible aux crans de zoom voisins.
+   Un cran de molette ou un déplacement s'affichent ainsi sans rien envoyer. */
+static void warm_textures(void)
+{
+	Tab *t = T;
+	int first, last, i, pass, R = render_level(t, t->level), lv[3];
+	double mx[3], my[3];
+	lv[0] = R; mx[0] = TILE; my[0] = TILE;
+	lv[1] = grid_floor(t->level) + GRID; mx[1] = my[1] = 0;
+	lv[2] = grid_ceil(t->level) - GRID; mx[2] = vw * 0.15; my[2] = vh * 0.15;
+	if (lv[1] > t->max_level) lv[1] = R;
+	if (lv[2] < t->min_level) lv[2] = R;
+	visible_range(&first, &last);
+	for (pass = 0; pass < 3; pass++) {
+		if (pass > 0 && lv[pass] == R) continue;
+		for (i = first; i <= last; i++) {
+			Page *p = &t->pages[i];
+			int a0, b0, a1, b1, tx, ty;
+			if (!tiles_for(t, p, lv[pass], mx[pass], my[pass], &a0, &b0, &a1, &b1)) continue;
+			for (ty = b0; ty <= b1; ty++)
+				for (tx = a0; tx <= a1; tx++) {
+					Job *j = hfind(t, i, lv[pass], tx, ty);
+					if (!j || j->state != J_READY || j->fmt == PK_FLAT || j->notex) continue;
+					if (j->tex) { tex_touch(j); continue; }
+					/* budget plein de textures utiles à cette image : on s'arrête là */
+					if (gpu_bytes + j->bytes > gpu_budget && (!lru_tail || lru_tail->tex_frame == frame_id)) return;
+					if (!promote(j, 0)) return;
+				}
+		}
+	}
+}
+
 void core_draw(void)
 {
+	frame_id++;
+	promo_count = promo_more = 0;
 	autoscroll_step();
 	if (sel_dirty) { sel_dirty = 0; update_selection(); }
 	find_step();
@@ -3143,13 +3555,19 @@ void core_draw(void)
 	}
 	gfx_begin(win_w, win_h, BG_COLOR);
 	gfx_origin(0, (float)bar_h);
-	if (has_doc()) draw_pages();
+	if (has_doc()) {
+		promo_deadline = platform_time() + 0.010;
+		draw_pages();
+		warm_textures();
+	}
 	draw_overlays();
 	gfx_origin(0, 0);
 	draw_tabbar();
 	draw_tooltip();
 	gfx_end();
-	dirty = find_more;   /* recherche pas finie : on continue à l'image suivante */
+	gpu_trim();
+	if (promo_force > 0) promo_force--;
+	dirty = find_more || promo_more;   /* recherche ou envoi de textures pas finis : on continue à l'image suivante */
 }
 
 int core_dirty(void)
@@ -3196,6 +3614,7 @@ static void activate(int idx)
 	}
 	active = idx;
 	T = tabs[idx];
+	promo_force = 2;   /* retour sur un onglet : ses tuiles à l'écran retrouvent leur texture d'un coup */
 	input_mode = T->need_password ? INPUT_PASSWORD : INPUT_NONE;
 	memset(input_buf, 0, sizeof input_buf);
 	drag = DRAG_NONE;
@@ -4068,8 +4487,9 @@ void core_stats(char *buf, int len)
 	int k, lists = 0;
 	if (!T) { snprintf(buf, len, "aucun onglet"); return; }
 	for (k = 0; k < T->npages; k++) if (T->pages[k].lstate == L_READY) lists++;
-	snprintf(buf, len, "onglet %d/%d jobs=%d tex=%.1fMo (total %.1fMo, budget %.0f) lists=%d (%.1fMo) zoom=%.1f%% niveau=%d rendu=%d page=%d/%d rot=%d",
-			active + 1, ntabs, T->njobs, T->tex_bytes / 1048576.0, tex_total / 1048576.0, tex_budget / 1048576.0, lists,
+	snprintf(buf, len, "onglet %d/%d jobs=%d tuiles=%.0fMo nominal (budget %.0f) -> %.1fMo en m\xc3\xa9moire, textures %.1fMo (nominal %.0f/%.0f, %ld envois, attentes rendu %ld / texture %ld) lists=%d (%.1fMo) zoom=%.1f%% niveau=%d rendu=%d page=%d/%d rot=%d",
+			active + 1, ntabs, T->njobs, tex_total / 1048576.0, tex_budget / 1048576.0, pk_total / 1048576.0,
+			gpu_real / 1048576.0, gpu_bytes / 1048576.0, gpu_budget / 1048576.0, st_promos, st_wait_render, st_wait_tex, lists,
 			T->list_bytes / 1048576.0, core_zoom_percent(), T->level, render_level(T, T->level), current_page() + 1, T->npages, T->rot);
 }
 
@@ -4103,14 +4523,17 @@ int core_init(int nthreads)
 	fz_catch(ctx) return -1;
 
 	{
-		/* Budgets mémoire proportionnels à la RAM : plus il y en a, plus on garde de
-		   tuiles calculées (zoom/déplacement instantanés) et de pages analysées.
-		   8 Go -> 0,8 Go de tuiles et 1 Go de pages ; 32 Go -> 1,5 Go et 3 Go. */
+		/* Budgets proportionnels à la RAM : plus il y en a, plus on garde de tuiles
+		   calculées (zoom/déplacement instantanés) et de pages analysées.
+		   8 Go -> 800 tuiles et 1 Go de pages ; 32 Go -> 1500 tuiles et 3 Go.
+		   Le budget de tuiles est compté en taille nominale (1 Mo par tuile de 512 px) ;
+		   compressées, elles occupent en réalité 4 à 30 fois moins (voir pack_pixmap). */
 		unsigned long long ram = ram_bytes();
 		const char *e = getenv("LIRE_TEX_MB");
 		tex_budget = (size_t)fmin(fmax(ram / 10.0, 256.0 * (1 << 20)), 1536.0 * (1 << 20));
 		list_budget = (size_t)fmin(fmax(ram / 8.0, 256.0 * (1 << 20)), 3072.0 * (1 << 20));
 		if (e && atoi(e) > 0) tex_budget = (size_t)atoi(e) << 20;
+		if ((e = getenv("LIRE_GPU_MB")) && atoi(e) > 0) gpu_budget_fixed = (size_t)atoi(e) << 20;
 		if ((e = getenv("LIRE_LIST_MB")) && atoi(e) > 0) list_budget = (size_t)atoi(e) << 20;
 	}
 	if (nthreads <= 0) nthreads = cpu_count() - 1;

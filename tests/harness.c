@@ -43,6 +43,14 @@ double platform_time(void)
 	return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
+static long rss_mb(void)
+{
+	long a = 0, b = 0;
+	FILE *f = fopen("/proc/self/statm", "r");
+	if (f) { if (fscanf(f, "%ld %ld", &a, &b) != 2) b = 0; fclose(f); }
+	return b * 4096 / 1048576;
+}
+
 static void wait_wake(double timeout)
 {
 	struct timespec ts;
@@ -446,6 +454,48 @@ int main(int argc, char **argv)
 			save("x04_rotation.png");
 		} else printf("!! rotation 90 : pas de texte trouvé\n");
 		core_shutdown();
+		return 0;
+	}
+	if (argc > 4 && !strcmp(argv[4], "memoire")) {
+		/* mémoire pendant un déplacement rapide, très zoomé (le cas qui fait grimper la RAM) */
+		int crans = argc > 5 ? atoi(argv[5]) : 12, f;
+		long peak = 0, r;
+		double worstf = 0, sumf = 0, incomplete = 0;
+		char st[256];
+		core_open(file);
+		pump("ouverture", 120);
+		if (core_page_count() > 1) { core_key(K_PGDN, 0); pump("page 2", 120); }
+		printf("RSS au repos, page entière : %ld Mo\n", rss_mb());
+		for (i = 0; i < crans; i++) core_wheel(1, 0, W / 2, H / 2, LMOD_CTRL);
+		pump("zoom fort", 120);
+		printf("RSS après zoom et anticipation : %ld Mo\n", rss_mb());
+		/* balayage à vitesse constante (indépendante de la cadence d'images) : 6 s, 120 crans de molette par seconde */
+		{
+			double last, now, tinc = 0, dur = 6.0;
+			t0 = last = platform_time();
+			for (f = 0; (now = platform_time()) - t0 < dur; f++) {
+				double tf, dt = now - last, n = 120 * dt;
+				int phase = (int)(now - t0) % 4;
+				last = now;
+				if (phase == 0) core_wheel(0, (float)-n, W / 2, H / 2, 0);
+				else if (phase == 2) core_wheel(0, (float)n, W / 2, H / 2, 0);
+				else core_wheel((float)-n, 0, W / 2, H / 2, 0);
+				tf = frame_cost();
+				if (tf > worstf) worstf = tf;
+				sumf += tf;
+				if (!core_view_complete()) tinc += dt;
+				r = rss_mb(); if (r > peak) peak = r;
+				wait_wake(0.016);
+			}
+			incomplete = tinc / dur * 100;
+			printf("balayage rapide (%d images en %.0f s) : RSS max %ld Mo, image moy. %.2f ms, pire %.1f ms, vue incomplète %.0f %% du temps\n",
+				f, dur, peak, sumf / f, worstf, incomplete);
+		}
+		pump("retour au repos", 120);
+		core_stats(st, sizeof st);
+		printf("RSS final : %ld Mo — %s\n", rss_mb(), st);
+		core_shutdown();
+		printf("textures restantes : %ld octets\n", soft_tex_bytes);
 		return 0;
 	}
 	if (argc > 4 && !strcmp(argv[4], "auto")) {

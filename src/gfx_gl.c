@@ -14,6 +14,9 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
+#ifndef GL_LUMINANCE8
+#define GL_LUMINANCE8 0x8040
+#endif
 #ifndef GL_UNPACK_ROW_LENGTH
 #define GL_UNPACK_ROW_LENGTH 0x0CF2
 #endif
@@ -58,7 +61,7 @@ static int pot(int v)
 	return p;
 }
 
-void *gfx_tex_create(int w, int h, const unsigned char *bgra, int stride)
+static GTex *tex_begin(int w, int h)
 {
 	GTex *t;
 	if (w <= 0 || h <= 0 || w > maxtex || h > maxtex) return NULL;
@@ -75,6 +78,48 @@ void *gfx_tex_create(int w, int h, const unsigned char *bgra, int stride)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, edge_clamp ? GL_CLAMP_TO_EDGE : GL_CLAMP);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, edge_clamp ? GL_CLAMP_TO_EDGE : GL_CLAMP);
+	return t;
+}
+
+static void *tex_end(GTex *t)
+{
+	if (glGetError() != GL_NO_ERROR) {
+		glDeleteTextures(1, &t->id);
+		cur_tex = 0;
+		free(t);
+		return NULL;
+	}
+	return t;
+}
+
+/* Niveaux de gris : la carte graphique garde 1 octet par pixel (GL_LUMINANCE8, OpenGL 1.1). */
+void *gfx_tex_create_gray(int w, int h, const unsigned char *gray)
+{
+	GTex *t = tex_begin(w, h);
+	if (!t) return NULL;
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	if (t->tw == w && t->th == h) {
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE8, w, h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, gray);
+	} else {
+		unsigned char *buf = malloc((size_t)t->tw * t->th);
+		int y;
+		for (y = 0; y < t->th; y++) {
+			const unsigned char *src = gray + (size_t)(y < h ? y : h - 1) * w;
+			unsigned char *dst = buf + (size_t)y * t->tw;
+			memcpy(dst, src, (size_t)w);
+			memset(dst + w, src[w - 1], (size_t)(t->tw - w));
+		}
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE8, t->tw, t->th, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, buf);
+		free(buf);
+	}
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	return tex_end(t);
+}
+
+void *gfx_tex_create(int w, int h, const unsigned char *bgra, int stride)
+{
+	GTex *t = tex_begin(w, h);
+	if (!t) return NULL;
 	if (t->tw == w && t->th == h) {
 		glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, bgra);
@@ -92,13 +137,7 @@ void *gfx_tex_create(int w, int h, const unsigned char *bgra, int stride)
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, t->tw, t->th, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, buf);
 		free(buf);
 	}
-	if (glGetError() != GL_NO_ERROR) {
-		glDeleteTextures(1, &t->id);
-		cur_tex = 0;
-		free(t);
-		return NULL;
-	}
-	return t;
+	return tex_end(t);
 }
 
 void gfx_tex_free(void *p)

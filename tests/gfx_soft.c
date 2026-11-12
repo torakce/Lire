@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int w, h; unsigned char *px; } STex;
+typedef struct { int w, h, gray; unsigned char *px; } STex;
 
 static unsigned char *fb;
 static int fbw, fbh;
@@ -21,10 +21,20 @@ void *gfx_tex_create(int w, int h, const unsigned char *bgra, int stride)
 {
 	STex *t = malloc(sizeof *t);
 	int y;
-	t->w = w; t->h = h;
+	t->w = w; t->h = h; t->gray = 0;
 	t->px = malloc((size_t)w * h * 4);
 	for (y = 0; y < h; y++) memcpy(t->px + (size_t)y * w * 4, bgra + (size_t)y * stride, (size_t)w * 4);
 	soft_tex_bytes += (long)w * h * 4;
+	return t;
+}
+
+void *gfx_tex_create_gray(int w, int h, const unsigned char *gray)
+{
+	STex *t = malloc(sizeof *t);
+	t->w = w; t->h = h; t->gray = 1;
+	t->px = malloc((size_t)w * h);
+	memcpy(t->px, gray, (size_t)w * h);
+	soft_tex_bytes += (long)w * h;
 	return t;
 }
 
@@ -32,7 +42,7 @@ void gfx_tex_free(void *p)
 {
 	STex *t = p;
 	if (!t) return;
-	soft_tex_bytes -= (long)t->w * t->h * 4;
+	soft_tex_bytes -= (long)t->w * t->h * (t->gray ? 1 : 4);
 	free(t->px);
 	free(t);
 }
@@ -85,9 +95,14 @@ void gfx_image(void *p, float sx0, float sy0, float sx1, float sy1,
 		if (ty >= t->h) ty = t->h - 1;
 		for (x = X0; x < X1; x++) {
 			int tx = (int)(sx0 + (x + 0.5f - x0) * kx);
-			unsigned char *s, *d = fb + ((size_t)y * fbw + x) * 4;
+			unsigned char *s, *d = fb + ((size_t)y * fbw + x) * 4, g4[4];
 			if (tx < 0) tx = 0;
 			if (tx >= t->w) tx = t->w - 1;
+			if (t->gray) {
+				g4[0] = g4[1] = g4[2] = t->px[(size_t)ty * t->w + tx];
+				g4[3] = 255;
+				s = g4;
+			} else
 			s = t->px + ((size_t)ty * t->w + tx) * 4;
 			if (!tint) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; }
 			else {

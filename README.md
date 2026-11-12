@@ -90,8 +90,12 @@ Les PDF protégés par mot de passe sont pris en charge.
    Résultat : un cran de molette, un déplacement ou `Pg.Suiv` sont nets **immédiatement**.
 6. **Zoom sans attente** : en attendant, la carte graphique (OpenGL) ré-étire ce qui est déjà calculé.
    Un rendu devenu inutile est interrompu immédiatement.
-7. **Mémoire proportionnelle à la RAM** : tuiles calculées ≈ 10 % de la RAM (max 1,5 Go), pages analysées
-   ≈ 12 % (max 3 Go). Un PC à 32 Go garde donc beaucoup plus d'avance qu'un portable à 8 Go, sans jamais saturer.
+7. **Mémoire maîtrisée** : les images calculées d'avance sont gardées **compressées** (un plan, ce sont des traits
+   sur fond blanc : niveaux de gris sur 1 octet au lieu de 4, zones blanches gratuites, plages unies regroupées) ;
+   seules celles qui sont à l'écran, ou sur le point d'y être, deviennent des textures pour la carte graphique.
+   La quantité d'anticipation reste proportionnelle à la RAM (≈ 1500 tuiles sur un PC à 32 Go), mais occupe
+   3 à 9 fois moins de mémoire qu'avant ; le rendu est identique au pixel près. Pages analysées : ≈ 12 % de la RAM
+   (max 3 Go). `F1` affiche en bas de l'aide où part la mémoire.
 8. Lissage des traits sur 64 niveaux, gestion ICC désactivée (inutile pour des plans, coûteuse).
 
 ### Mesures (environnement de test à 2 cœurs lents, donc pessimistes)
@@ -107,6 +111,14 @@ comme le ferait quelqu'un qui regarde le plan :
 | 3 crans d'un coup | 2,2 s | **0,4 s** | 0,5 s | **0,05 s** |
 | Retour page entière | instantané | instantané | 1,0 s | **0,09 s** |
 | **Total des attentes du scénario** | **17,5 s** | **1,4 s** | **7,3 s** | **0,6 s** |
+
+Mémoire du processus après un balayage rapide à fort zoom, avec le budget d'un PC à 32 Go (banc de test) :
+
+| Document | v1.5.0 | v1.5.1 |
+|---|---|---|
+| Plan A0 de densité courante | 1,7 Go | **0,19 Go** |
+| Liasse de 10 plans A0 très chargés | 1,9 Go | **0,54 Go** |
+| Plan 4A0 extrêmement chargé (1,2 M traits) | 1,2 Go | **0,46 Go** |
 
 Rendu d'une vue 2560×1440 du plan 4A0 sur un seul cœur : page entière 8,0 s → 0,9 s, zoom ×8 3,0 s → 0,35 s.
 Le rendu se répartit maintenant sur tous les cœurs : sur un PC de bureau à 8–16 cœurs, compter 4 à 8 fois mieux.
