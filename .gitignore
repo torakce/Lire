@@ -3,3 +3,4 @@ build/
 deps/
 *.o
 *.exe
+__pycache__/
