@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 extern int soft_enabled;
 extern long soft_tex_bytes;
@@ -36,6 +39,65 @@ void platform_open_with(const char *p, int x, int y) { printf("  [ouvrir avec] %
 void platform_toggle_fullscreen(void) {}
 void platform_quit(void) {}
 void platform_wheel_mode_changed(int z) { (void)z; }
+/* page d'accueil : menu contextuel piloté par le test, fichiers sous LIRE_DATA */
+int ctx_menu_answer = -1;
+int platform_context_menu(const char *const *l, const int *f, int n, int x, int y)
+{
+	int i, r = ctx_menu_answer;
+	printf("  [menu contextuel en %d,%d]", x, y);
+	for (i = 0; i < n; i++) if (!(f[i] & 4)) printf(" %d:%s", i, l[i]);
+	printf(" -> %d\n", r);
+	ctx_menu_answer = -1;
+	return r;
+}
+void platform_show_in_folder(const char *p) { printf("  [afficher dans le dossier] %s\n", p); }
+static char data_dir[1024];
+const char *platform_data_dir(void)
+{
+	if (!data_dir[0]) {
+		char sub[1100];
+		const char *e = getenv("LIRE_DATA");
+		snprintf(data_dir, sizeof data_dir, "%s", e && *e ? e : "/tmp/lire-test-data");
+		mkdir(data_dir, 0755);
+		snprintf(sub, sizeof sub, "%s/miniatures", data_dir);
+		mkdir(sub, 0755);
+	}
+	return data_dir;
+}
+int platform_file_info(const char *path, long long *size, long long *mtime)
+{
+	struct stat st;
+	if (stat(path, &st) || !S_ISREG(st.st_mode)) return 0;
+	*size = st.st_size;
+	*mtime = (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+	return 1;
+}
+char *platform_read_file(const char *path, size_t *len)
+{
+	FILE *f = fopen(path, "rb");
+	char *b;
+	long n;
+	if (!f) return NULL;
+	fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+	b = malloc(n + 1);
+	*len = fread(b, 1, n, f);
+	b[*len] = 0;
+	fclose(f);
+	return b;
+}
+int platform_write_file(const char *path, const void *data, size_t len)
+{
+	char tmp[1200];
+	FILE *f;
+	snprintf(tmp, sizeof tmp, "%s.tmp", path);
+	f = fopen(tmp, "wb");
+	if (!f) return 0;
+	if (fwrite(data, 1, len, f) != len) { fclose(f); unlink(tmp); return 0; }
+	fclose(f);
+	return rename(tmp, path) == 0;
+}
+void platform_remove_file(const char *path) { unlink(path); }
+
 double platform_time(void)
 {
 	struct timespec t;
@@ -49,6 +111,18 @@ static long rss_mb(void)
 	FILE *f = fopen("/proc/self/statm", "r");
 	if (f) { if (fscanf(f, "%ld %ld", &a, &b) != 2) b = 0; fclose(f); }
 	return b * 4096 / 1048576;
+}
+
+/* même empreinte que core.c (nom du fichier de miniature) */
+static void thumb_path_for_test(const char *path, char *buf, size_t n)
+{
+	unsigned long long h = 1469598103934665603ull;
+	const char *q;
+	for (q = path; *q; q++) {
+		int c = *q == '\\' ? '/' : tolower((unsigned char)*q);
+		h = (h ^ (unsigned char)c) * 1099511628211ull;
+	}
+	snprintf(buf, n, "%s/miniatures/%016llx.png", platform_data_dir(), h);
 }
 
 static void wait_wake(double timeout)
@@ -454,6 +528,139 @@ int main(int argc, char **argv)
 			save("x04_rotation.png");
 		} else printf("!! rotation 90 : pas de texte trouvé\n");
 		core_shutdown();
+		return 0;
+	}
+	if (argc > 4 && !strcmp(argv[4], "accueil")) {
+		/* page d'accueil : historique, miniatures, clic, ×, menu, clavier, fichier disparu ou modifié, limite */
+		extern char last_clipboard[4096];
+		extern int ctx_menu_answer;
+		const char *dd = platform_data_dir();
+		char tmp[1200], tf[1200], big[1200];
+		int nf = argc - 5, k, x, y, tw, th, tw2, th2, cnt;
+		long long sz, mt, sz1 = 0, mt1;
+		printf("dossier de données : %s, historique au démarrage : %d fichier(s)\n", dd, core_home_count());
+		for (k = 0; k < 4; k++) { core_poll(); core_draw(); wait_wake(0.02); }
+		save("h00_accueil.png");
+		/* ouverture de chaque fichier, attente de sa miniature */
+		for (k = 0; k < nf; k++) {
+			core_open(argv[5 + k]);
+			pump("  ouverture", 120);
+			t0 = platform_time();
+			while (!core_home_thumb(0, &tw, &th) && platform_time() - t0 < 60) { core_poll(); core_draw(); wait_wake(0.02); }
+			printf("  %-40s miniature %dx%d en %.0f ms (après vue nette)\n", argv[5 + k], tw, th, (platform_time() - t0) * 1000);
+		}
+		while (core_tab_count()) core_key('W', LMOD_CTRL);
+		for (k = 0; k < 8; k++) { core_poll(); core_draw(); wait_wake(0.01); }
+		printf("tous les onglets fermés : %d entrées, la première : %s\n", core_home_count(), core_home_path(0));
+		save("h01_recents.png");
+		/* survol de la carte 1 : bouton × et infobulle du chemin */
+		if (core_home_card_center(1, &x, &y)) {
+			core_mouse_move(x, y, 0);
+			t0 = platform_time(); while (platform_time() - t0 < 0.7) { core_poll(); core_draw(); wait_wake(0.05); }
+			save("h02_survol.png");
+		}
+		/* clic sur la carte 2 : ouverture, puis elle passe en tête */
+		snprintf(big, sizeof big, "%s", core_home_path(2) ? core_home_path(2) : "");
+		if (core_home_card_center(2, &x, &y)) {
+			core_mouse_down(BTN_LEFT, x, y, 0); core_mouse_up(BTN_LEFT, x, y, 0);
+			pump("  clic sur la 3e carte", 120);
+			printf("  onglets : %d, en tête de l'historique : %s (attendu %s)\n", core_tab_count(), core_home_path(0), big);
+			core_key('W', LMOD_CTRL);
+		}
+		/* bouton × de la carte 0 : retirée, miniature effacée */
+		cnt = core_home_count();
+		snprintf(big, sizeof big, "%s", core_home_path(0));
+		if (core_home_card_center(0, &x, &y)) {
+			int rx = x - 112 + 224 - 30 + 13, ry = y - 79 + 4 + 13;
+			core_mouse_move(rx, ry, 0);
+			core_draw();
+			save("h03_survol_croix.png");
+			core_mouse_down(BTN_LEFT, rx, ry, 0); core_mouse_up(BTN_LEFT, rx, ry, 0);
+			printf("  × : %d -> %d entrées, « %s » encore présent : %s\n", cnt, core_home_count(), big,
+				core_home_path(0) && !strcmp(core_home_path(0), big) ? "OUI (!!)" : "non");
+		}
+		/* menu contextuel : copier le chemin, puis retirer */
+		if (core_home_card_center(0, &x, &y)) {
+			ctx_menu_answer = 2;
+			core_mouse_down(BTN_RIGHT, x, y, 0); core_mouse_up(BTN_RIGHT, x, y, 0);
+			printf("  menu « copier le chemin » : presse-papiers = %s\n", last_clipboard);
+			cnt = core_home_count();
+			ctx_menu_answer = 4;
+			core_mouse_down(BTN_RIGHT, x, y, 0); core_mouse_up(BTN_RIGHT, x, y, 0);
+			printf("  menu « retirer » : %d -> %d entrées\n", cnt, core_home_count());
+		}
+		/* clavier : flèche droite x2 puis Entrée = 2e carte */
+		snprintf(big, sizeof big, "%s", core_home_path(1) ? core_home_path(1) : "");
+		core_key(K_RIGHT, 0); core_draw(); save("h04_clavier.png");
+		core_key(K_RIGHT, 0); core_key(K_ENTER, 0);
+		pump("  clavier : Entrée", 120);
+		printf("  clavier : onglets %d, ouvert %s (attendu %s)\n", core_tab_count(), core_home_path(0), big);
+		core_key('W', LMOD_CTRL);
+		/* fichier modifié (nouvel export) : miniature refaite ; puis fichier disparu */
+		if (nf >= 2) {
+			snprintf(tmp, sizeof tmp, "%s/plan copie é.pdf", dd);
+			for (k = 0; k < 2; k++) {
+				char cmd[3000];
+				snprintf(cmd, sizeof cmd, "cp '%s' '%s'", argv[5 + k], tmp);
+				if (system(cmd)) printf("!! copie\n");
+				if (k) { struct timespec ts = { 1, 100000000 }; nanosleep(&ts, NULL); if (system("true")) {} snprintf(cmd, sizeof cmd, "touch '%s'", tmp); if (system(cmd)) {} }
+				core_open(tmp);
+				pump("  ouverture copie", 120);
+				t0 = platform_time();
+				while (platform_time() - t0 < 60) {
+					core_poll(); core_draw(); wait_wake(0.02);
+					if (core_home_thumb(0, &tw2, &th2) && (k == 0 || tw2 != tw || th2 != th)) break;
+				}
+				thumb_path_for_test(tmp, tf, sizeof tf);
+				platform_file_info(tf, &sz, &mt);
+				printf("  copie, version %d : miniature %dx%d, PNG %lld octets\n", k + 1, tw2, th2, sz);
+				if (k == 0) { tw = tw2; th = th2; sz1 = sz; mt1 = mt; (void)mt1; }
+				core_key('W', LMOD_CTRL);
+			}
+			printf("  miniature refaite après modification du fichier : %s\n", (tw2 != tw || th2 != th || sz != sz1) ? "oui" : "NON (!!)");
+			unlink(tmp);
+			for (k = 0; k < 4; k++) { core_poll(); core_draw(); }
+			if (core_home_card_center(0, &x, &y)) {
+				core_mouse_down(BTN_LEFT, x, y, 0); core_mouse_up(BTN_LEFT, x, y, 0);
+				core_draw();
+				printf("  clic sur un fichier disparu : onglets %d (0 attendu)\n", core_tab_count());
+				save("h05_disparu.png");
+			}
+		}
+		/* limite de l'historique : 45 fichiers ouverts */
+		{
+			char many[1200], cmd[3000];
+			int nthumbs = 0;
+			snprintf(many, sizeof many, "%s/nombreux", dd);
+			mkdir(many, 0755);
+			for (k = 0; k < 45; k++) {
+				snprintf(tmp, sizeof tmp, "%s/fichier %02d.pdf", many, k);
+				snprintf(cmd, sizeof cmd, "cp '%s' '%s'", argv[5], tmp);
+				if (system(cmd)) printf("!! copie\n");
+				core_open(tmp);
+				for (n = 0; n < 3; n++) { core_poll(); core_draw(); wait_wake(0.01); }
+				core_key('W', LMOD_CTRL);
+			}
+			t0 = platform_time();
+			while (platform_time() - t0 < 3) { core_poll(); core_draw(); wait_wake(0.02); }
+			snprintf(cmd, sizeof cmd, "ls '%s/miniatures' | grep -c png", dd);
+			{
+				FILE *pp = popen(cmd, "r");
+				if (pp) { if (fscanf(pp, "%d", &nthumbs) != 1) nthumbs = -1; pclose(pp); }
+			}
+			printf("  après 45 ouvertures : %d entrées (max 40), %d miniatures sur disque\n", core_home_count(), nthumbs);
+		}
+		for (k = 0; k < 20; k++) { core_poll(); core_draw(); wait_wake(0.01); }
+		save("h06_beaucoup.png");
+		core_wheel(-6, 0, W / 2, H / 2, 0);
+		for (k = 0; k < 20; k++) { core_poll(); core_draw(); wait_wake(0.01); }
+		save("h07_defile.png");
+		core_resize(520, 700);
+		for (k = 0; k < 20; k++) { core_poll(); core_draw(); wait_wake(0.01); }
+		save("h08_etroit.png");
+		core_resize(W, H);
+		core_shutdown();
+		printf("textures restantes : %ld octets\n", soft_tex_bytes);
 		return 0;
 	}
 	if (argc > 4 && !strcmp(argv[4], "memoire")) {

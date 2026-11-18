@@ -421,7 +421,7 @@ void platform_open_with(const char *path, int x, int y)
 	free(file);
 }
 
-int platform_popup_menu(const char *const *labels, const int *flags, int n, int right_x, int top_y)
+static int track_menu(const char *const *labels, const int *flags, int n, int px, int py, UINT align)
 {
 	HMENU menu = CreatePopupMenu();
 	POINT pt;
@@ -445,12 +445,133 @@ int platform_popup_menu(const char *const *labels, const int *flags, int n, int 
 			free(w);
 		}
 	}
-	pt.x = right_x;
-	pt.y = top_y;
+	pt.x = px;
+	pt.y = py;
 	ClientToScreen(hwnd, &pt);
-	cmd = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, NULL);
+	cmd = (int)TrackPopupMenuEx(menu, TPM_RETURNCMD | align | TPM_TOPALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, hwnd, NULL);
 	DestroyMenu(menu);
 	return cmd > 0 ? cmd - 1 : -1;
+}
+
+int platform_popup_menu(const char *const *labels, const int *flags, int n, int right_x, int top_y)
+{
+	return track_menu(labels, flags, n, right_x, top_y, TPM_RIGHTALIGN);
+}
+
+int platform_context_menu(const char *const *labels, const int *flags, int n, int x, int y)
+{
+	return track_menu(labels, flags, n, x, y, TPM_LEFTALIGN);
+}
+
+void platform_show_in_folder(const char *utf8_path)
+{
+	wchar_t *w = to_wide(utf8_path);
+	PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(w);
+	if (pidl) {
+		if (FAILED(SHOpenFolderAndSelectItems(pidl, 0, NULL, 0))) {
+			wchar_t args[4200];
+			_snwprintf(args, 4200, L"/select,\"%ls\"", w);
+			args[4199] = 0;
+			ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+		}
+		ILFree(pidl);
+	}
+	free(w);
+}
+
+/* ---------- fichiers de Lire (historique, miniatures) ---------- */
+
+static char data_dir[2048];
+static int data_dir_done;
+
+const char *platform_data_dir(void)
+{
+	if (!data_dir_done) {
+		wchar_t base[1100];
+		DWORD n;
+		data_dir_done = 1;
+		n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, 1024);
+		if (!n || n >= 1024) n = GetEnvironmentVariableW(L"APPDATA", base, 1024);
+		if (n && n < 1024) {
+			char *u;
+			wcscat(base, L"\\Lire");
+			CreateDirectoryW(base, NULL);
+			if (GetFileAttributesW(base) & FILE_ATTRIBUTE_DIRECTORY && GetFileAttributesW(base) != INVALID_FILE_ATTRIBUTES) {
+				size_t l = wcslen(base);
+				u = to_utf8(base);
+				snprintf(data_dir, sizeof data_dir, "%s", u);
+				free(u);
+				wcscat(base, L"\\miniatures");
+				CreateDirectoryW(base, NULL);
+				base[l] = 0;
+			}
+		}
+	}
+	return data_dir[0] ? data_dir : NULL;
+}
+
+int platform_file_info(const char *path, long long *size, long long *mtime)
+{
+	WIN32_FILE_ATTRIBUTE_DATA a;
+	wchar_t *w = to_wide(path);
+	BOOL ok = GetFileAttributesExW(w, GetFileExInfoStandard, &a);
+	free(w);
+	if (!ok || (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return 0;
+	*size = (long long)(((unsigned long long)a.nFileSizeHigh << 32) | a.nFileSizeLow);
+	*mtime = (long long)(((unsigned long long)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime);
+	return 1;
+}
+
+char *platform_read_file(const char *path, size_t *len)
+{
+	wchar_t *w = to_wide(path);
+	HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+	LARGE_INTEGER sz;
+	char *buf = NULL;
+	DWORD got = 0;
+	free(w);
+	if (f == INVALID_HANDLE_VALUE) return NULL;
+	if (GetFileSizeEx(f, &sz) && sz.QuadPart >= 0 && sz.QuadPart < (64 << 20)) {
+		buf = malloc((size_t)sz.QuadPart + 1);
+		if (buf && ReadFile(f, buf, (DWORD)sz.QuadPart, &got, NULL)) {
+			buf[got] = 0;
+			*len = got;
+		} else {
+			free(buf);
+			buf = NULL;
+		}
+	}
+	CloseHandle(f);
+	return buf;
+}
+
+int platform_write_file(const char *path, const void *data, size_t len)
+{
+	wchar_t *w = to_wide(path), *tmp;
+	size_t l = wcslen(w);
+	HANDLE f;
+	DWORD put = 0;
+	int ok = 0;
+	tmp = malloc((l + 8) * sizeof *tmp);
+	wcscpy(tmp, w);
+	wcscat(tmp, L".tmp");
+	f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (f != INVALID_HANDLE_VALUE) {
+		ok = WriteFile(f, data, (DWORD)len, &put, NULL) && put == len;
+		CloseHandle(f);
+		if (ok) ok = MoveFileExW(tmp, w, MOVEFILE_REPLACE_EXISTING) != 0;
+		if (!ok) DeleteFileW(tmp);
+	}
+	free(tmp);
+	free(w);
+	return ok;
+}
+
+void platform_remove_file(const char *path)
+{
+	wchar_t *w = to_wide(path);
+	DeleteFileW(w);
+	free(w);
 }
 
 void platform_set_clipboard(const char *utf8)
@@ -616,6 +737,7 @@ static int map_key(WPARAM vk)
 	case VK_F3: return K_F3;
 	case VK_TAB: return K_TAB;
 	case VK_F4: return K_F4;
+	case VK_DELETE: return K_DELETE;
 	}
 	if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z')) return (int)vk;
 	if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return (int)('0' + (vk - VK_NUMPAD0));

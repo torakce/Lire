@@ -2,6 +2,8 @@
 #ifndef LIRE_CORE_H
 #define LIRE_CORE_H
 
+#include <stddef.h>
+
 enum { BTN_LEFT = 1, BTN_MIDDLE = 2, BTN_RIGHT = 3 };
 enum { LMOD_CTRL = 1, LMOD_SHIFT = 2, LMOD_ALT = 4 };
 
@@ -9,7 +11,7 @@ enum { LMOD_CTRL = 1, LMOD_SHIFT = 2, LMOD_ALT = 4 };
 enum {
 	K_PGUP = 256, K_PGDN, K_HOME, K_END, K_UP, K_DOWN, K_LEFT, K_RIGHT,
 	K_SPACE, K_ENTER, K_ESC, K_BACKSPACE, K_F1, K_F5, K_F11, K_PLUS, K_MINUS,
-	K_TAB, K_F4, K_F3
+	K_TAB, K_F4, K_F3, K_DELETE
 };
 
 enum { CUR_ARROW, CUR_HAND, CUR_CROSS, CUR_AUTO, CUR_TEXT };
@@ -57,6 +59,10 @@ int    core_tab_count(void);
 int    core_active_tab(void);
 void   core_stats(char *buf, int len);
 void   core_find_info(int *total, int *rank, int *pending, int *page);   /* recherche (tests) */
+int    core_home_count(void);                                /* page d'accueil (tests) */
+int    core_home_card_center(int i, int *x, int *y);         /* 1 si la carte i est à l'écran */
+int    core_home_thumb(int i, int *w, int *h);               /* 1 si l'entrée i a une miniature */
+const char *core_home_path(int i);
 
 /* Fonctions à fournir par la plateforme */
 void   platform_wake(void);                  /* appelable depuis n'importe quel thread */
@@ -71,5 +77,15 @@ void   platform_toggle_fullscreen(void);
 void   platform_quit(void);
 void   platform_wheel_mode_changed(int zoom);
 double platform_time(void);                  /* secondes */
+/* menu contextuel au point (x, y) de la fenêtre (coin haut gauche) ; indice choisi ou -1 */
+int    platform_context_menu(const char *const *labels, const int *flags, int n, int x, int y);
+void   platform_show_in_folder(const char *utf8_path);   /* ouvre l'Explorateur sur le fichier */
+/* Fichiers (chemins UTF-8). Dossier de données de Lire, créé au besoin avec son sous-dossier
+   « miniatures » (%LOCALAPPDATA%\Lire sous Windows) ; NULL si indisponible. */
+const char *platform_data_dir(void);
+int    platform_file_info(const char *path, long long *size, long long *mtime);   /* 1 si le fichier existe */
+char  *platform_read_file(const char *path, size_t *len);    /* contenu + 0 final, à libérer avec free ; NULL si absent */
+int    platform_write_file(const char *path, const void *data, size_t len);   /* remplacement atomique ; 1 si OK */
+void   platform_remove_file(const char *path);
 
 #endif

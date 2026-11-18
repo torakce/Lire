@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define TILE 512
 #define LPO 768                    /* niveaux de zoom par octave (pas de 0,09 %) */
@@ -52,6 +53,8 @@
 #define MAX_CLOSED 20              /* historique des onglets fermés (Ctrl+Maj+T) */
 #define PREVIEW_LEVEL INT_MIN
 #define BG_COLOR 0x3c3f43
+#define MAX_RECENT 40              /* fichiers gardés dans l'historique (page d'accueil) */
+#define THUMB_PX 400               /* plus grand côté d'une miniature (réduite à l'affichage) */
 
 enum { L_NONE, L_QUEUED, L_BUILDING, L_READY, L_ERROR };
 enum { J_IDLE, J_QUEUED, J_RUNNING, J_DONE, J_READY, J_FAILED };
@@ -149,7 +152,19 @@ struct Tab {
 	float synced_dpi;
 	char label[200];
 	int label_w, label_px;
+	int thumb_want;                    /* miniature de la page 1 à faire dès que sa display list est prête */
 };
+
+/* Miniature pour l'historique : une copie de la display list de la page 1, rendue par un
+   chargeur libre. Indépendante de l'onglet : fermer celui-ci ne l'annule pas. */
+typedef struct ThumbJob {
+	char *path;
+	fz_display_list *list;
+	fz_rect bounds;
+	fz_buffer *png;
+	int w, h;
+	struct ThumbJob *next;
+} ThumbJob;
 
 typedef struct { Job **v; int n, cap; } JobVec;
 
@@ -213,6 +228,9 @@ static char toast[300];
 static double toast_until;
 static int hover = HIT_NONE;
 static double hover_since;
+
+static void history_thumb_ready(const char *path, fz_buffer *png, int w, int h);   /* page d'accueil (plus bas) */
+static void history_touch(Tab *t);
 
 /* ---------- utilitaires ---------- */
 
@@ -896,12 +914,44 @@ static int queued_stext(Tab *t)
 }
 
 /* (sous mu) prochaine page en attente d'analyse, sans la retirer de la file */
+static ThumbJob *thumb_q, *thumb_done_q;   /* (sous mu) miniatures à faire / faites */
+static fz_cookie thumb_cookie;              /* interrompt une miniature en cours (fin du programme) */
+
+/* (sous mu) la page 1 d'un fichier qui attend sa miniature est analysée : on en confie
+   une copie de la display list aux chargeurs */
+static void thumb_enqueue(Tab *t)
+{
+	ThumbJob *j;
+	if (!t->thumb_want || !t->pages || t->npages <= 0) return;
+	if (t->pages[0].lstate == L_ERROR) { t->thumb_want = 0; return; }
+	if (t->pages[0].lstate != L_READY || !t->pages[0].list) return;
+	j = calloc(1, sizeof *j);
+	if (!j) return;
+	j->path = strdup(t->path);
+	j->list = fz_keep_display_list(ctx, t->pages[0].list);
+	j->bounds = t->pages[0].bounds;
+	j->next = thumb_q;
+	thumb_q = j;
+	t->thumb_want = 0;
+	cond_broadcast(&cv_load);
+}
+
 static int queued_page(Tab *t)
 {
 	int k;
 	for (k = t->lq_pos; k < t->nlq; k++)
 		if (t->lq[k] < t->npages && t->pages[t->lq[k]].lstate == L_QUEUED) return 1;
 	return queued_stext(t) >= 0;
+}
+
+/* (sous mu) l'onglet affiché attend-il une page à l'écran ? */
+static int urgent_pending(Tab *t)
+{
+	int k;
+	if (!t || !t->doc || t->need_password || !t->pages) return 0;
+	for (k = t->lq_pos; k < t->nlq; k++)
+		if (t->lq[k] < t->npages && t->pages[t->lq[k]].lstate == L_QUEUED && t->pages[t->lq[k]].urgent) return 1;
+	return 0;
 }
 
 /* (sous mu, relâché pendant le travail) extrait le texte d'une page depuis sa display list */
@@ -948,6 +998,67 @@ static int any_loader_busy(void)
 	return 0;
 }
 
+/* (sous mu, relâché pendant le travail) miniature de la page 1, depuis sa display list.
+   Rendue en niveaux de gris si la page l'est (PNG et texture 3 fois plus petits). */
+static void build_thumb(fz_context *c)
+{
+	ThumbJob *j = thumb_q;
+	fz_pixmap *pix = NULL, *gray = NULL;
+	fz_device *dev = NULL;
+	fz_buffer *png = NULL;
+	fz_rect b = j->bounds;
+	thumb_q = j->next;
+	mutex_unlock(&mu);
+	fz_var(pix);
+	fz_var(gray);
+	fz_var(dev);
+	fz_var(png);
+	fz_try(c) {
+		double s = THUMB_PX / fmax(b.x1 - b.x0, b.y1 - b.y0);
+		fz_matrix m = fz_scale((float)s, (float)s);
+		fz_irect bb = fz_round_rect(fz_transform_rect(b, m));
+		unsigned char *sp;
+		size_t i, n;
+		int isgray = 1;
+		pix = fz_new_pixmap_with_bbox(c, fz_device_rgb(c), bb, NULL, 0);
+		fz_clear_pixmap_with_value(c, pix, 0xff);
+		dev = fz_new_draw_device(c, fz_identity, pix);
+		fz_run_display_list(c, j->list, dev, m, fz_rect_from_irect(bb), &thumb_cookie);
+		fz_close_device(c, dev);
+		if (!thumb_cookie.abort) {
+			j->w = fz_pixmap_width(c, pix);
+			j->h = fz_pixmap_height(c, pix);
+			sp = fz_pixmap_samples(c, pix);
+			n = (size_t)j->w * j->h;
+			for (i = 0; i < n && isgray; i++)
+				if (sp[i * 3] != sp[i * 3 + 1] || sp[i * 3] != sp[i * 3 + 2]) isgray = 0;
+			if (isgray) {
+				unsigned char *gp;
+				gray = fz_new_pixmap_with_bbox(c, fz_device_gray(c), bb, NULL, 0);
+				gp = fz_pixmap_samples(c, gray);
+				for (i = 0; i < n; i++) gp[i] = sp[i * 3];
+			}
+			png = fz_new_buffer_from_pixmap_as_png(c, gray ? gray : pix, fz_default_color_params);
+		}
+	}
+	fz_always(c) {
+		fz_drop_device(c, dev);
+		fz_drop_pixmap(c, pix);
+		fz_drop_pixmap(c, gray);
+		fz_drop_display_list(c, j->list);
+		j->list = NULL;
+	}
+	fz_catch(c) {
+		fz_drop_buffer(c, png);
+		png = NULL;
+	}
+	mutex_lock(&mu);
+	j->png = png;
+	j->next = thumb_done_q;
+	thumb_done_q = j;
+	resched = 1;
+}
+
 static void loader_main(void *arg)
 {
 	int k = (int)(intptr_t)arg;
@@ -960,6 +1071,14 @@ static void loader_main(void *arg)
 		fz_display_list *list;
 		fz_document *d;
 		fz_rect lb;
+		/* miniature pour la page d'accueil : quand l'onglet affiché n'attend rien d'urgent */
+		if (!paused && thumb_q && !urgent_pending(t)) {
+			build_thumb(c);
+			mutex_unlock(&mu);
+			platform_wake();
+			mutex_lock(&mu);
+			continue;
+		}
 		if (paused || !t || !t->doc || t->need_password || !t->pages || !queued_page(t)) {
 			cond_wait(&cv_load, &mu);
 			continue;
@@ -977,6 +1096,7 @@ static void loader_main(void *arg)
 				mutex_lock(&mu);
 				continue;
 			}
+
 			if (nx < 0) { cond_wait(&cv_load, &mu); continue; }
 		}
 		d = k == 0 ? t->doc : t->ldoc[k];
@@ -2488,7 +2608,23 @@ int core_poll(void)
 	}
 	list = done_head;
 	done_head = NULL;
-	mutex_unlock(&mu);
+	{
+		/* miniatures : la page 1 d'un fichier ouvert est prête -> on en confie une copie
+		   aux chargeurs ; celles qui sont faites sont enregistrées pour la page d'accueil */
+		ThumbJob *done = thumb_done_q, *j;
+		thumb_done_q = NULL;
+		for (ti = 0; ti < ntabs; ti++) thumb_enqueue(tabs[ti]);
+		mutex_unlock(&mu);
+		while (done) {
+			j = done;
+			done = j->next;
+			if (j->png) history_thumb_ready(j->path, j->png, j->w, j->h);
+			fz_drop_buffer(ctx, j->png);
+			free(j->path);
+			free(j);
+			changed = 1;
+		}
+	}
 	if (relayout) sync_view();
 	/* Enregistrement des tuiles calculées. Rien n'est envoyé à la carte graphique ici :
 	   c'est fait à l'affichage, pour les seules tuiles à l'écran (promote). */
@@ -2554,8 +2690,8 @@ int core_view_complete(void)
 
 /* ---------- texte et icônes de l'interface (rendus par MuPDF) ---------- */
 
-typedef struct { char s[200]; int px, bold; void *tex; int w, h; unsigned used; } TextTex;
-#define NTEXT 160
+typedef struct { char s[512]; int px, bold; void *tex; int w, h; unsigned used; } TextTex;
+#define NTEXT 400
 static TextTex texts[NTEXT];
 static unsigned text_clock;
 static fz_font *font_regular, *font_bold;
@@ -3313,6 +3449,702 @@ static void line_quad(float x0, float y0, float x1, float y1, float w, unsigned 
 	gfx_quad(xy, argb);
 }
 
+
+/* ---------- historique des fichiers ouverts et page d'accueil ----------
+   Fichier texte dans le dossier de données de Lire (%LOCALAPPDATA%\Lire sous Windows) :
+   une ligne par fichier, du plus récent au plus ancien. Les miniatures (page 1) sont
+   des PNG dans « miniatures », nommées d'après une empreinte du chemin. */
+
+typedef struct {
+	char *path;
+	long long opened, size, mtime;
+	int npages, tw, th;                /* tw, th : taille de la miniature (0 si aucune) */
+	int missing;                       /* introuvable à la dernière tentative d'ouverture */
+	/* affichage */
+	unsigned ver, tex_ver;             /* version de la miniature sur disque / chargée */
+	void *tex;
+	int tex_failed, tex_w, tex_h, tex_box;   /* texture réduite au pixel près pour la carte */
+	char *d_name, *d_dir;              /* nom et dossier raccourcis pour la carte */
+	int d_key;
+} Recent;
+
+static Recent *recents;
+static int nrecent;
+static unsigned recent_ver_seq = 1;
+static int home_hover = -1, home_hover_x, home_sel = -1, home_kbd;
+static double home_scroll, home_hover_since;
+static int home_textures;
+
+enum { HH_NONE = 0, HH_OPEN = 1, HH_DROP = 2, HH_CARD = 1000, HH_REMOVE = 3000 };
+
+static const char *base_dir_end(const char *p)
+{
+	const char *b = base_name(p);
+	return b > p ? b - 1 : p;
+}
+
+static void history_file(char *buf, size_t n)
+{
+	const char *d = platform_data_dir();
+	snprintf(buf, n, "%s/historique.txt", d ? d : ".");
+}
+
+static void thumb_file(const char *path, char *buf, size_t n)
+{
+	/* empreinte FNV-1a du chemin normalisé (casse et séparateurs) */
+	uint64_t h = 1469598103934665603ull;
+	const char *d = platform_data_dir(), *q;
+	for (q = path; *q; q++) {
+		int c = *q == '\\' ? '/' : tolower((unsigned char)*q);
+		h = (h ^ (unsigned char)c) * 1099511628211ull;
+	}
+	snprintf(buf, n, "%s/miniatures/%016llx.png", d ? d : ".", (unsigned long long)h);
+}
+
+static void recent_free_display(Recent *r)
+{
+	if (r->tex) { gfx_tex_free(r->tex); r->tex = NULL; home_textures--; }
+	r->tex_ver = 0;
+	free(r->d_name); free(r->d_dir);
+	r->d_name = r->d_dir = NULL;
+	r->d_key = 0;
+}
+
+static void recent_free(Recent *r)
+{
+	recent_free_display(r);
+	free(r->path);
+	memset(r, 0, sizeof *r);
+}
+
+static void history_save(void)
+{
+	char file[1200];
+	size_t cap = 64 + (size_t)nrecent * 1200, n = 0;
+	char *buf;
+	int i;
+	if (!platform_data_dir()) return;
+	buf = malloc(cap);
+	if (!buf) return;
+	n += snprintf(buf + n, cap - n, "Lire historique 1\n");
+	for (i = 0; i < nrecent && n < cap; i++) {
+		Recent *r = &recents[i];
+		n += snprintf(buf + n, cap - n, "%lld\t%lld\t%lld\t%d\t%d\t%d\t%s\n",
+				r->opened, r->size, r->mtime, r->npages, r->tw, r->th, r->path);
+	}
+	if (n > cap) n = cap;
+	history_file(file, sizeof file);
+	platform_write_file(file, buf, n);
+	free(buf);
+}
+
+static void history_load(void)
+{
+	char file[1200], *data, *line, *next;
+	size_t len = 0;
+	history_file(file, sizeof file);
+	data = platform_data_dir() ? platform_read_file(file, &len) : NULL;
+	if (!data) return;
+	recents = calloc(MAX_RECENT, sizeof *recents);
+	for (line = data; line && *line && nrecent < MAX_RECENT; line = next) {
+		long long o, sz, mt;
+		int np, tw, th, used = 0, k;
+		next = strchr(line, '\n');
+		if (next) *next++ = 0;
+		if (line[0] && line[strlen(line) - 1] == '\r') line[strlen(line) - 1] = 0;
+		if (sscanf(line, "%lld\t%lld\t%lld\t%d\t%d\t%d\t%n", &o, &sz, &mt, &np, &tw, &th, &used) < 6 || used <= 0 || !line[used]) continue;
+		for (k = 0; k < nrecent; k++) if (same_path(recents[k].path, line + used)) break;
+		if (k < nrecent) continue;
+		recents[nrecent].path = strdup(line + used);
+		recents[nrecent].opened = o;
+		recents[nrecent].size = sz;
+		recents[nrecent].mtime = mt;
+		recents[nrecent].npages = np;
+		recents[nrecent].tw = tw > 0 && tw <= 4096 ? tw : 0;
+		recents[nrecent].th = th > 0 && th <= 4096 ? th : 0;
+		recents[nrecent].ver = recent_ver_seq++;
+		nrecent++;
+	}
+	free(data);
+}
+
+static int history_find(const char *path)
+{
+	int i;
+	for (i = 0; i < nrecent; i++)
+		if (same_path(recents[i].path, path)) return i;
+	return -1;
+}
+
+static void history_remove(int i, int del_thumb)
+{
+	char tf[1200];
+	if (i < 0 || i >= nrecent) return;
+	if (del_thumb) {
+		thumb_file(recents[i].path, tf, sizeof tf);
+		platform_remove_file(tf);
+	}
+	recent_free(&recents[i]);
+	memmove(recents + i, recents + i + 1, (nrecent - i - 1) * sizeof *recents);
+	nrecent--;
+	memset(&recents[nrecent], 0, sizeof *recents);
+	if (home_hover >= nrecent) home_hover = -1;
+	if (home_sel >= nrecent) home_sel = nrecent - 1;
+	dirty = 1;
+}
+
+/* Fichier ouvert avec succès : il passe en tête de l'historique ; sa miniature est
+   (re)faite s'il n'en a pas ou s'il a changé depuis (nouvel export du plan). */
+static void history_touch(Tab *t)
+{
+	char tf[1200];
+	long long size = 0, mtime = 0, ts, tm;
+	int i, have_thumb;
+	Recent r;
+	if (!t->path || !platform_data_dir()) return;
+	if (!recents) recents = calloc(MAX_RECENT, sizeof *recents);
+	platform_file_info(t->path, &size, &mtime);
+	i = history_find(t->path);
+	if (i >= 0) {
+		r = recents[i];
+		memmove(recents + 1, recents, i * sizeof *recents);
+	} else {
+		memset(&r, 0, sizeof r);
+		r.path = strdup(t->path);
+		if (nrecent == MAX_RECENT) history_remove(nrecent - 1, 1);
+		memmove(recents + 1, recents, nrecent * sizeof *recents);
+		nrecent++;
+	}
+	thumb_file(t->path, tf, sizeof tf);
+	have_thumb = r.tw > 0 && r.size == size && r.mtime == mtime && platform_file_info(tf, &ts, &tm);
+	r.opened = (long long)time(NULL);
+	r.size = size;
+	r.mtime = mtime;
+	r.npages = t->npages;
+	r.missing = 0;
+	recents[0] = r;
+	/* pas de miniature pour un document protégé par mot de passe */
+	if (!have_thumb && !t->password) {
+		mutex_lock(&mu);
+		t->thumb_want = 1;
+		cond_broadcast(&cv_load);
+		mutex_unlock(&mu);
+	}
+	home_hover = home_sel = -1;
+	history_save();
+}
+
+/* (thread principal) une miniature vient d'être rendue : on l'enregistre */
+static void history_thumb_ready(const char *path, fz_buffer *png, int w, int h)
+{
+	char tf[1200];
+	unsigned char *data;
+	size_t len = fz_buffer_storage(ctx, png, &data);
+	int i = history_find(path);
+	if (i < 0) return;   /* retiré de la liste entre-temps */
+	thumb_file(path, tf, sizeof tf);
+	if (platform_write_file(tf, data, len)) {
+		recents[i].tw = w;
+		recents[i].th = h;
+		recents[i].ver = recent_ver_seq++;
+		recents[i].tex_failed = 0;
+		history_save();
+	}
+}
+
+/* charge la miniature d'une entrée en texture, réduite avec un vrai filtre à la taille
+   exacte où elle est affichée (box_w x box_h) ; 0 si pas (encore) disponible */
+static int recent_texture(Recent *r, int box_w, int box_h)
+{
+	char tf[1200];
+	fz_image *img = NULL;
+	fz_pixmap *pix = NULL, *sc = NULL;
+	int box = box_w * 10000 + box_h;
+	if (r->tex && r->tex_ver == r->ver && r->tex_box == box) return 1;
+	if (r->tw <= 0 || r->tex_failed == (int)r->ver) return 0;
+	if (r->tex) { gfx_tex_free(r->tex); r->tex = NULL; home_textures--; }
+	thumb_file(r->path, tf, sizeof tf);
+	fz_var(img);
+	fz_var(pix);
+	fz_var(sc);
+	fz_try(ctx) {
+		int w, h, n, x, y, fw, fh;
+		ptrdiff_t st;
+		const unsigned char *sp;
+		double k;
+		fz_pixmap *src;
+		img = fz_new_image_from_file(ctx, tf);
+		pix = fz_get_pixmap_from_image(ctx, img, NULL, NULL, NULL, NULL);
+		w = fz_pixmap_width(ctx, pix); h = fz_pixmap_height(ctx, pix);
+		r->tw = w; r->th = h;
+		k = fmin(1.0, fmin((double)box_w / w, (double)box_h / h));
+		fw = (int)floor(w * k + 0.5); fh = (int)floor(h * k + 0.5);
+		if (fw < 1) fw = 1;
+		if (fh < 1) fh = 1;
+		src = pix;
+		if (fw < w || fh < h) {
+			sc = fz_scale_pixmap(ctx, pix, 0, 0, (float)fw, (float)fh, NULL);
+			if (sc) src = sc;
+		}
+		w = fz_pixmap_width(ctx, src); h = fz_pixmap_height(ctx, src);
+		n = fz_pixmap_components(ctx, src);
+		st = fz_pixmap_stride(ctx, src);
+		sp = fz_pixmap_samples(ctx, src);
+		if (n == 1 && !fz_pixmap_alpha(ctx, src)) {
+			unsigned char *g = malloc((size_t)w * h);
+			for (y = 0; y < h; y++) memcpy(g + (size_t)y * w, sp + (size_t)y * st, w);
+			r->tex = gfx_tex_create_gray(w, h, g);
+			free(g);
+		} else if (n >= 3) {
+			unsigned char *b = malloc((size_t)w * h * 4);
+			for (y = 0; y < h; y++)
+				for (x = 0; x < w; x++) {
+					const unsigned char *q = sp + (size_t)y * st + (size_t)x * n;
+					unsigned char *d = b + ((size_t)y * w + x) * 4;
+					d[0] = q[2]; d[1] = q[1]; d[2] = q[0]; d[3] = 255;
+				}
+			r->tex = gfx_tex_create(w, h, b, w * 4);
+			free(b);
+		}
+		r->tex_w = w;
+		r->tex_h = h;
+		r->tex_box = box;
+	}
+	fz_always(ctx) {
+		fz_drop_pixmap(ctx, sc);
+		fz_drop_pixmap(ctx, pix);
+		fz_drop_image(ctx, img);
+	}
+	fz_catch(ctx) {}
+	if (!r->tex) { r->tex_failed = (int)r->ver; return 0; }
+	r->tex_ver = r->ver;
+	home_textures++;
+	return 1;
+}
+
+/* textures de la page d'accueil libérées dès qu'un document est affiché */
+static void home_free_textures(void)
+{
+	int i;
+	for (i = 0; i < nrecent; i++)
+		if (recents[i].tex) { gfx_tex_free(recents[i].tex); recents[i].tex = NULL; recents[i].tex_ver = 0; }
+	home_textures = 0;
+}
+
+static void fmt_when(long long when, char *buf, size_t n)
+{
+	static const char *mois[] = { "janv.", "f\xc3\xa9vr.", "mars", "avr.", "mai", "juin", "juil.", "ao\xc3\xbbt", "sept.", "oct.", "nov.", "d\xc3\xa9""c." };
+	static const char *jours[] = { "dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi" };
+	time_t now = time(NULL), w = (time_t)when;
+	struct tm a, b, *p;
+	long days;
+	p = localtime(&now); if (!p) { snprintf(buf, n, "-"); return; } a = *p;
+	p = localtime(&w); if (!p) { snprintf(buf, n, "-"); return; } b = *p;
+	{
+		struct tm a0 = a, b0 = b;
+		a0.tm_hour = b0.tm_hour = 12; a0.tm_min = b0.tm_min = a0.tm_sec = b0.tm_sec = 0;
+		days = (long)lround(difftime(mktime(&a0), mktime(&b0)) / 86400.0);
+	}
+	if (days <= 0) snprintf(buf, n, "aujourd'hui %02d:%02d", b.tm_hour, b.tm_min);
+	else if (days == 1) snprintf(buf, n, "hier %02d:%02d", b.tm_hour, b.tm_min);
+	else if (days < 7) snprintf(buf, n, "%s %02d:%02d", jours[b.tm_wday], b.tm_hour, b.tm_min);
+	else if (b.tm_year == a.tm_year) snprintf(buf, n, "%d %s", b.tm_mday, mois[b.tm_mon]);
+	else snprintf(buf, n, "%d %s %d", b.tm_mday, mois[b.tm_mon], b.tm_year + 1900);
+}
+
+/* texte raccourci à une largeur donnée, avec « … » à la fin (ou au début : chemins) */
+static char *ellipsize(const char *s, int px, int bold, float maxw, int from_start)
+{
+	size_t len = strlen(s), lo = 0, hi, best = 0;
+	char *buf = malloc(len + 8);
+	if (text_measure(s, px, bold) <= maxw) { memcpy(buf, s, len + 1); return buf; }
+	hi = len;
+	/* recherche dichotomique du plus long morceau qui tient (coupé sur un caractère entier) */
+	while (lo <= hi) {
+		size_t mid = (lo + hi) / 2, cut = mid;
+		if (from_start) {
+			while (cut < len && ((unsigned char)s[len - cut] & 0xc0) == 0x80) cut++;
+			memcpy(buf, "\xe2\x80\xa6", 3);
+			memcpy(buf + 3, s + len - cut, cut + 1);
+		} else {
+			while (cut > 0 && ((unsigned char)s[cut] & 0xc0) == 0x80) cut--;
+			memcpy(buf, s, cut);
+			memcpy(buf + cut, "\xe2\x80\xa6", 4);
+		}
+		if (text_measure(buf, px, bold) <= maxw) { best = cut; lo = mid + 1; }
+		else { if (mid == 0) break; hi = mid - 1; }
+	}
+	if (from_start) {
+		memcpy(buf, "\xe2\x80\xa6", 3);
+		memcpy(buf + 3, s + len - best, best + 1);
+	} else {
+		memcpy(buf, s, best);
+		memcpy(buf + best, "\xe2\x80\xa6", 4);
+	}
+	return buf;
+}
+
+typedef struct {
+	float x0, cw, ch, gap, thumb_h, top, content_h, hx0, hw;
+	float bx0, by0, bx1, by1;          /* bouton « Ouvrir un fichier » */
+	int cols;
+} HomeLayout;
+
+static void home_layout(HomeLayout *L)
+{
+	float pad = 36 * ui, avail = vw - 2 * pad, bw;
+	int rows;
+	L->cw = 224 * ui;
+	L->gap = 18 * ui;
+	L->thumb_h = 158 * ui;
+	L->ch = L->thumb_h + 68 * ui;
+	L->cols = (int)floorf((avail + L->gap) / (L->cw + L->gap));
+	if (L->cols < 1) L->cols = 1;
+	L->hw = fmaxf(L->cols * (L->cw + L->gap) - L->gap, fminf(avail, 560 * ui));
+	L->hx0 = floorf((vw - L->hw) / 2);
+	L->x0 = L->hx0;
+	bw = text_measure("Ouvrir un fichier\xe2\x80\xa6", (int)(14 * ui), 1) + 40 * ui;
+	L->bx1 = L->hx0 + L->hw;
+	L->bx0 = L->bx1 - bw;
+	L->by0 = 34 * ui;
+	L->by1 = L->by0 + 38 * ui;
+	L->top = 150 * ui;
+	rows = (nrecent + L->cols - 1) / L->cols;
+	L->content_h = nrecent ? L->top + rows * (L->ch + L->gap) + 24 * ui : vh;
+}
+
+static void home_clamp_scroll(void)
+{
+	HomeLayout L;
+	home_layout(&L);
+	home_scroll = clampd(home_scroll, 0, fmax(0, L.content_h - vh));
+}
+
+static void card_pos(HomeLayout *L, int i, float *x, float *y)
+{
+	*x = L->x0 + (i % L->cols) * (L->cw + L->gap);
+	*y = L->top + (i / L->cols) * (L->ch + L->gap) - (float)home_scroll;
+}
+
+static int home_hit(int x, int y)
+{
+	HomeLayout L;
+	int i;
+	home_layout(&L);
+	if (x >= L.bx0 && x < L.bx1 && y >= L.by0 - home_scroll && y < L.by1 - home_scroll) return HH_OPEN;
+	if (!nrecent) return y > L.top - 20 * ui ? HH_DROP : HH_NONE;
+	for (i = 0; i < nrecent; i++) {
+		float cx, cy;
+		card_pos(&L, i, &cx, &cy);
+		if (cy > vh || cy + L.ch < 0) continue;
+		if (x >= cx && x < cx + L.cw && y >= cy && y < cy + L.ch) {
+			float rx = cx + L.cw - 30 * ui, ry = cy + 4 * ui;
+			if (x >= rx && x < rx + 26 * ui && y >= ry && y < ry + 26 * ui) return HH_REMOVE + i;
+			return HH_CARD + i;
+		}
+	}
+	return HH_NONE;
+}
+
+static void draw_home_card(HomeLayout *L, int i, int *loads)
+{
+	Recent *r = &recents[i];
+	float x, y, bx0, by0, bw, bh, tx0, ty0, tx1, ty1;
+	int hov = home_hover == HH_CARD + i || home_hover == HH_REMOVE + i, sel = home_kbd && home_sel == i;
+	int pxn = (int)(13 * ui), pxs = (int)(11.5f * ui), key;
+	char when[80], line3[160];
+	card_pos(L, i, &x, &y);
+	if (y > vh || y + L->ch < 0) return;
+	gfx_rect(x, y, x + L->cw, y + L->ch, hov ? 0xff34383d : 0xff2b2e33);
+	if (sel) {
+		float b = 2 * ui;
+		gfx_rect(x - b, y - b, x + L->cw + b, y, 0xff4a90d9);
+		gfx_rect(x - b, y + L->ch, x + L->cw + b, y + L->ch + b, 0xff4a90d9);
+		gfx_rect(x - b, y, x, y + L->ch, 0xff4a90d9);
+		gfx_rect(x + L->cw, y, x + L->cw + b, y + L->ch, 0xff4a90d9);
+	}
+	/* zone de la miniature : la page, à ses proportions, avec une ombre */
+	bx0 = x + 12 * ui; by0 = y + 12 * ui; bw = L->cw - 24 * ui; bh = L->thumb_h - 18 * ui;
+	{
+		float pw = r->tw > 0 ? (float)r->tw : 210, ph = r->th > 0 ? (float)r->th : 297;
+		float k = fminf(bw / pw, bh / ph);
+		tx0 = floorf(bx0 + (bw - pw * k) / 2); ty0 = floorf(by0 + (bh - ph * k) / 2);
+		tx1 = tx0 + floorf(pw * k); ty1 = ty0 + floorf(ph * k);
+	}
+	gfx_rect(tx0 + 2 * ui, ty0 + 2 * ui, tx1 + 2 * ui, ty1 + 2 * ui, 0x60000000);
+	{
+		int bwp = (int)floorf(bw), bhp = (int)floorf(bh), box = bwp * 10000 + bhp;
+		int fresh = r->tex && r->tex_ver == r->ver && r->tex_box == box;
+		if (!fresh && r->tw > 0 && r->tex_failed != (int)r->ver) {
+			if (*loads < 6) { (*loads)++; recent_texture(r, bwp, bhp); }
+			else dirty = 1;   /* chargées quelques-unes par image */
+		}
+	}
+	if (r->tex) {
+		/* texture à la taille exacte de la vignette : dessinée au pixel près */
+		tx0 = floorf(bx0 + (bw - r->tex_w) / 2); ty0 = floorf(by0 + (bh - r->tex_h) / 2);
+		tx1 = tx0 + r->tex_w; ty1 = ty0 + r->tex_h;
+		gfx_image(r->tex, 0, 0, (float)r->tex_w, (float)r->tex_h, tx0, ty0, tx1, ty1, 0);
+	} else {
+		/* pas encore de miniature : une page blanche stylisée */
+		int pxp = (int)(12 * ui);
+		gfx_rect(tx0, ty0, tx1, ty1, 0xffe9ebee);
+		draw_text("PDF", pxp, 1, floorf((tx0 + tx1) / 2 - text_measure("PDF", pxp, 1) / 2), floorf((ty0 + ty1) / 2 - pxp * 0.7f), 0xff9aa0a8);
+	}
+	if (r->missing) gfx_rect(tx0, ty0, tx1, ty1, 0xb02b2e33);
+	/* textes : nom, dossier, date et pages (raccourcis une fois pour toutes à cette largeur) */
+	key = (int)(L->cw * 10 + ui * 100);
+	if (r->d_key != key || !r->d_name) {
+		char dir[1024];
+		size_t dl = (size_t)(base_dir_end(r->path) - r->path);
+		free(r->d_name); free(r->d_dir);
+		if (dl >= sizeof dir) dl = sizeof dir - 1;
+		memcpy(dir, r->path, dl);
+		dir[dl] = 0;
+		r->d_name = ellipsize(base_name(r->path), pxn, 1, L->cw - 24 * ui, 0);
+		r->d_dir = ellipsize(dir[0] ? dir : "\xe2\x80\x94", pxs, 0, L->cw - 24 * ui, 1);
+		r->d_key = key;
+	}
+	draw_text(r->d_name, pxn, 1, x + 12 * ui, y + L->thumb_h + 2 * ui, r->missing ? 0xff8a9099 : 0xffeceef1);
+	draw_text(r->d_dir, pxs, 0, x + 12 * ui, y + L->thumb_h + 23 * ui, 0xff8a9099);
+	if (r->missing) {
+		draw_text("Introuvable (d\xc3\xa9plac\xc3\xa9 ou supprim\xc3\xa9 ?)", pxs, 0, x + 12 * ui, y + L->thumb_h + 41 * ui, 0xffe8a0a0);
+	} else {
+		fmt_when(r->opened, when, sizeof when);
+		if (r->npages > 0) snprintf(line3, sizeof line3, "%s  \xc2\xb7  %d page%s", when, r->npages, r->npages > 1 ? "s" : "");
+		else snprintf(line3, sizeof line3, "%s", when);
+		draw_text(line3, pxs, 0, x + 12 * ui, y + L->thumb_h + 41 * ui, 0xff8a9099);
+	}
+	/* bouton « retirer de la liste » au survol */
+	if (hov) {
+		float rx = x + L->cw - 30 * ui, ry = y + 4 * ui, c = 13 * ui, sz = 4.5f * ui;
+		int on = home_hover == HH_REMOVE + i;
+		gfx_rect(rx, ry, rx + 26 * ui, ry + 26 * ui, on ? 0xffc0453a : 0xd0202226);
+		line_quad(rx + c - sz, ry + c - sz, rx + c + sz, ry + c + sz, 1.6f * ui, 0xffffffff);
+		line_quad(rx + c - sz, ry + c + sz, rx + c + sz, ry + c - sz, 1.6f * ui, 0xffffffff);
+	}
+}
+
+static void draw_home(void)
+{
+	HomeLayout L;
+	int i, loads = 0, big = (int)(26 * ui), px = (int)(14 * ui), pxs = (int)(13 * ui);
+	float sy;
+	home_clamp_scroll();
+	home_layout(&L);
+	sy = -(float)home_scroll;
+	draw_text("Lire", big, 1, L.hx0, L.by0 + sy + 2 * ui, 0xffffffff);
+	draw_text("Glissez des PDF dans la fen\xc3\xaatre, ou ouvrez-en un  \xc2\xb7  F1 : aide", pxs, 0, L.hx0, L.by0 + sy + 48 * ui, 0xff9aa0a8);
+	/* bouton Ouvrir */
+	{
+		int on = home_hover == HH_OPEN;
+		float tw = text_measure("Ouvrir un fichier\xe2\x80\xa6", px, 1);
+		gfx_rect(L.bx0, L.by0 + sy, L.bx1, L.by1 + sy, on ? 0xff5a9de3 : 0xff4a90d9);
+		draw_text("Ouvrir un fichier\xe2\x80\xa6", px, 1, floorf((L.bx0 + L.bx1 - tw) / 2), floorf(L.by0 + sy + (L.by1 - L.by0) / 2 - px * 0.72f), 0xffffffff);
+	}
+	if (!nrecent) {
+		/* aucun historique : grande zone de dépôt */
+		float z0 = L.top - 20 * ui, z1 = fmaxf(z0 + 160 * ui, vh - 40 * ui), b = 1.5f * ui, d;
+		const char *l1 = "Glissez un ou plusieurs fichiers PDF ici";
+		const char *l2 = "Les fichiers ouverts appara\xc3\xaetront ici, avec un aper\xc3\xa7u de leur premi\xc3\xa8re page.";
+		unsigned col = home_hover == HH_DROP ? 0xff6c727a : 0xff52575e;
+		for (d = L.hx0; d < L.hx0 + L.hw; d += 14 * ui) {
+			gfx_rect(d, z0, fminf(d + 8 * ui, L.hx0 + L.hw), z0 + b, col);
+			gfx_rect(d, z1 - b, fminf(d + 8 * ui, L.hx0 + L.hw), z1, col);
+		}
+		for (d = z0; d < z1; d += 14 * ui) {
+			gfx_rect(L.hx0, d, L.hx0 + b, fminf(d + 8 * ui, z1), col);
+			gfx_rect(L.hx0 + L.hw - b, d, L.hx0 + L.hw, fminf(d + 8 * ui, z1), col);
+		}
+		draw_text(l1, (int)(19 * ui), 1, floorf(L.hx0 + (L.hw - text_measure(l1, (int)(19 * ui), 1)) / 2), floorf((z0 + z1) / 2 - 30 * ui), 0xffe6e8eb);
+		draw_text(l2, pxs, 0, floorf(L.hx0 + (L.hw - text_measure(l2, pxs, 0)) / 2), floorf((z0 + z1) / 2 + 6 * ui), 0xff9aa0a8);
+		return;
+	}
+	draw_text("R\xc3\xa9""cemment ouverts", px, 1, L.hx0, L.top - 34 * ui + sy, 0xffc9ccd1);
+	for (i = 0; i < nrecent; i++) draw_home_card(&L, i, &loads);
+	/* barre de défilement (indication) */
+	if (L.content_h > vh) {
+		float h = fmaxf(vh * vh / L.content_h, 30 * ui), t0 = (float)(home_scroll / (L.content_h - vh)) * (vh - h);
+		gfx_rect(vw - 6 * ui, t0, vw - 2 * ui, t0 + h, 0x80a0a6ae);
+	}
+	/* chemin complet en infobulle */
+	if (home_hover >= HH_CARD && home_hover < HH_REMOVE && !home_kbd && platform_time() - home_hover_since > 0.6) {
+		Recent *r = &recents[home_hover - HH_CARD];
+		int pt = (int)lround(12 * ui);
+		float cx, cy, pad = 7 * ui, w, h, tx;
+		TextTex *tt = text_get(r->path, pt, 0);
+		card_pos(&L, home_hover - HH_CARD, &cx, &cy);
+		w = tt->w + 2 * pad; h = tt->h + pad;
+		tx = fminf(fmaxf(4, (float)home_hover_x - w / 2), vw - 4 - w);
+		cy = cy + L.ch + 4 * ui;
+		if (cy + h > vh - 4) cy = cy - L.ch - h - 8 * ui;
+		gfx_rect(tx, cy, tx + w, cy + h, 0xf0101113);
+		draw_text(r->path, pt, 0, tx + pad, cy + pad / 2, 0xffe6e8eb);
+	}
+}
+
+/* rend visible la carte i (clavier) */
+static void home_reveal(int i)
+{
+	HomeLayout L;
+	float x, y;
+	home_layout(&L);
+	card_pos(&L, i, &x, &y);
+	if (y < 0) home_scroll += y - 12 * ui;
+	else if (y + L.ch > vh) home_scroll += y + L.ch - vh + 12 * ui;
+	home_clamp_scroll();
+}
+
+static void home_open(int i)
+{
+	long long sz, mt;
+	char *path, msg[600];
+	if (i < 0 || i >= nrecent) return;
+	path = strdup(recents[i].path);
+	if (!platform_file_info(path, &sz, &mt)) {
+		recents[i].missing = 1;
+		snprintf(msg, sizeof msg, "Introuvable : \xc2\xab %s \xc2\xbb (d\xc3\xa9plac\xc3\xa9, renomm\xc3\xa9 ou supprim\xc3\xa9 ?)", base_name(path));
+		set_toast(msg);
+		free(path);
+		dirty = 1;
+		return;
+	}
+	recents[i].missing = 0;
+	core_open(path);
+	free(path);
+}
+
+static void home_clear_all(void)
+{
+	while (nrecent > 0) history_remove(nrecent - 1, 1);
+	home_scroll = 0;
+	history_save();
+}
+
+static void home_context_menu(int i, int x, int y)
+{
+	const char *labels[] = { "Ouvrir", "Afficher dans le dossier", "Copier le chemin", "", "Retirer de la liste", "Effacer tout l'historique\xe2\x80\xa6" };
+	int flags[] = { 0, 0, 0, MENU_SEPARATOR, 0, 0 };
+	int r = platform_context_menu(labels, flags, 6, x, y + bar_h);
+	char *path;
+	if (i < 0 || i >= nrecent) return;
+	path = strdup(recents[i].path);
+	switch (r) {
+	case 0: home_open(i); break;
+	case 1: platform_show_in_folder(path); break;
+	case 2: platform_set_clipboard(path); set_toast("Chemin copi\xc3\xa9"); break;
+	case 4: history_remove(i, 1); history_save(); break;
+	case 5: {
+		char q[120];
+		const char *l2[] = { q, "", "Effacer l'historique", "Annuler" };
+		int f2[] = { MENU_DISABLED, MENU_SEPARATOR, 0, 0 };
+		snprintf(q, sizeof q, "Effacer les %d fichiers r\xc3\xa9""cents ?", nrecent);
+		if (platform_context_menu(l2, f2, 4, x, y + bar_h) == 2) home_clear_all();
+		break;
+	}
+	}
+	free(path);
+	dirty = 1;
+}
+
+static void home_mouse_down(int btn, int x, int y)
+{
+	int h = home_hit(x, y);
+	home_kbd = 0;
+	if (btn == BTN_LEFT) {
+		if (h == HH_OPEN || h == HH_DROP) platform_open_dialog();
+		else if (h >= HH_REMOVE) { history_remove(h - HH_REMOVE, 1); history_save(); home_clamp_scroll(); }
+		else if (h >= HH_CARD) home_open(h - HH_CARD);
+	} else if (btn == BTN_RIGHT && h >= HH_CARD) {
+		int i = h >= HH_REMOVE ? h - HH_REMOVE : h - HH_CARD;
+		home_context_menu(i, x, y);
+	} else if (btn == BTN_MIDDLE && h >= HH_CARD && h < HH_REMOVE) {
+		home_open(h - HH_CARD);
+	}
+	home_hover = home_hit(x, y);
+}
+
+static void home_mouse_move(int x, int y)
+{
+	int h = y >= 0 ? home_hit(x, y) : HH_NONE;
+	if (h != home_hover) {
+		home_hover = h;
+		home_hover_since = platform_time();
+		dirty = 1;
+	} else if (h >= HH_CARD && abs(x - home_hover_x) > 40) {
+		dirty = 1;
+	}
+	home_hover_x = x;
+	if (home_kbd) { home_kbd = 0; dirty = 1; }
+}
+
+static void home_key(int key)
+{
+	HomeLayout L;
+	int cols;
+	if (!nrecent) {
+		if (key == K_ENTER) platform_open_dialog();
+		return;
+	}
+	home_layout(&L);
+	cols = L.cols;
+	if (!home_kbd || home_sel < 0) {
+		if (key == K_LEFT || key == K_RIGHT || key == K_UP || key == K_DOWN || key == K_HOME || key == K_END || key == K_ENTER) {
+			home_kbd = 1;
+			if (home_sel < 0) home_sel = 0;
+			if (key != K_ENTER) { home_reveal(home_sel); dirty = 1; return; }
+		}
+	}
+	switch (key) {
+	case K_LEFT: home_sel = home_sel > 0 ? home_sel - 1 : 0; break;
+	case K_RIGHT: home_sel = home_sel + 1 < nrecent ? home_sel + 1 : home_sel; break;
+	case K_UP: if (home_sel - cols >= 0) home_sel -= cols; break;
+	case K_DOWN: home_sel = home_sel + cols < nrecent ? home_sel + cols : nrecent - 1; break;
+	case K_HOME: home_sel = 0; break;
+	case K_END: home_sel = nrecent - 1; break;
+	case K_PGDN: home_scroll += vh * 0.9; home_clamp_scroll(); dirty = 1; return;
+	case K_PGUP: home_scroll -= vh * 0.9; home_clamp_scroll(); dirty = 1; return;
+	case K_ENTER: if (home_kbd && home_sel >= 0) home_open(home_sel); return;
+	case K_DELETE:
+		if (home_kbd && home_sel >= 0) {
+			history_remove(home_sel, 1);
+			history_save();
+			if (home_sel >= nrecent) home_sel = nrecent - 1;
+			home_clamp_scroll();
+		}
+		return;
+	default: return;
+	}
+	home_kbd = 1;
+	home_reveal(home_sel);
+	dirty = 1;
+}
+
+/* accès pour les tests */
+int core_home_count(void) { return nrecent; }
+
+int core_home_card_center(int i, int *x, int *y)
+{
+	HomeLayout L;
+	float cx, cy;
+	if (T || i < 0 || i >= nrecent) return 0;
+	home_layout(&L);
+	card_pos(&L, i, &cx, &cy);
+	*x = (int)(cx + L.cw / 2);
+	*y = (int)(cy + L.thumb_h / 2) + bar_h;
+	return cy + L.ch > 0 && cy < vh;
+}
+
+int core_home_thumb(int i, int *w, int *h)
+{
+	if (i < 0 || i >= nrecent) return 0;
+	*w = recents[i].tw;
+	*h = recents[i].th;
+	return recents[i].tw > 0;
+}
+
+const char *core_home_path(int i) { return i >= 0 && i < nrecent ? recents[i].path : NULL; }
+
 static void draw_overlays(void)
 {
 	char buf[300];
@@ -3320,15 +4152,7 @@ static void draw_overlays(void)
 	int px = (int)(13 * ui);
 	double t = platform_time();
 
-	if (!T) {
-		int big = (int)(20 * ui), w;
-		const char *l1 = "Glissez un ou plusieurs fichiers PDF ici";
-		const char *l2 = "ou cliquez / Ctrl+O pour ouvrir   \xc2\xb7   F1 : aide";
-		w = text_width(l1, big, 1);
-		draw_text(l1, big, 1, floorf((vw - w) / 2.0f), floorf(vh / 2.0f - big * 1.6f), 0xffe6e8eb);
-		w = text_width(l2, px + 1, 0);
-		draw_text(l2, px + 1, 0, floorf((vw - w) / 2.0f), floorf(vh / 2.0f + px * 0.5f), 0xff9aa0a8);
-	}
+	if (!T) draw_home();
 
 	if (drag == DRAG_AUTO) {
 		int s = (int)lround(30 * ui);
@@ -3555,6 +4379,7 @@ void core_draw(void)
 	}
 	gfx_begin(win_w, win_h, BG_COLOR);
 	gfx_origin(0, (float)bar_h);
+	if (T && home_textures) home_free_textures();
 	if (has_doc()) {
 		promo_deadline = platform_time() + 0.010;
 		draw_pages();
@@ -3583,6 +4408,10 @@ int core_timeout_ms(void)
 	else if (toast[0]) { toast[0] = 0; dirty = 1; }
 	if (hover != HIT_NONE && !drag && t - hover_since < 0.5) {
 		int h = (int)((0.5 - (t - hover_since)) * 1000) + 20;
+		if (ms < 0 || h < ms) ms = h;
+	}
+	if (!T && home_hover >= HH_CARD && home_hover < HH_REMOVE && t - home_hover_since < 0.6) {
+		int h = (int)((0.6 - (t - home_hover_since)) * 1000) + 20;
 		if (ms < 0 || h < ms) ms = h;
 	}
 	if (find_active() && find_due > 0) {
@@ -3648,6 +4477,9 @@ static void close_tab(int idx)
 	if (sel_tab == t) clear_selection();
 	if (find_tab == t) find_close();
 	quiesce();
+	mutex_lock(&mu);
+	thumb_enqueue(t);   /* fermé très vite : la miniature se fait quand même */
+	mutex_unlock(&mu);
 	if (t->doc && !t->need_password) remember_closed(t->path);
 	if (was_active) T = NULL;
 	tab_free(t);
@@ -3740,6 +4572,7 @@ static int finish_open(void)
 	t->synced_vh = vh;
 	t->synced_dpi = dpi;
 	update_title();
+	history_touch(t);
 	view_dirty = need_schedule = dirty = 1;
 	return 0;
 }
@@ -4025,6 +4858,7 @@ static void set_hover(int x, int y)
 void core_mouse_leave(void)
 {
 	if (hover != HIT_NONE) { hover = HIT_NONE; dirty = 1; }
+	if (home_hover != HH_NONE) { home_hover = HH_NONE; dirty = 1; }
 }
 
 void core_mouse_down(int btn, int x, int y, int mods)
@@ -4063,6 +4897,7 @@ void core_mouse_down(int btn, int x, int y, int mods)
 			return;
 		}
 	}
+	if (!T) { home_mouse_down(btn, x, y); return; }
 	if (!has_doc()) {
 		if (btn == BTN_LEFT) platform_open_dialog();
 		return;
@@ -4114,6 +4949,7 @@ void core_mouse_move(int x, int y, int mods)
 	y -= bar_h;
 	dx = x - mx; dy = y - my;
 	mx = x; my = y;
+	if (!T) { home_mouse_move(x, y); return; }
 	if (!has_doc()) return;
 	switch (drag) {
 	case DRAG_PAN:
@@ -4214,6 +5050,12 @@ void core_wheel(float dy, float dx, int x, int y, int mods)
 		return;
 	}
 	y -= bar_h;
+	if (!T) {
+		home_scroll -= dy * 110 * ui;
+		home_clamp_scroll();
+		home_mouse_move(x, y);
+		return;
+	}
 	if (!has_doc() || drag == DRAG_ZOOM) return;
 	if (zoom && dy != 0) {
 		zoom_step(dy, x, y);
@@ -4348,6 +5190,7 @@ shortcuts:
 	case K_F11: platform_toggle_fullscreen(); return;
 	case K_ESC: show_help = 0; toast[0] = 0; clear_selection(); return;
 	}
+	if (!T) { home_key(key); return; }
 	if (!has_doc()) return;
 	cur = current_page();
 	row = &T->rows[T->pages[cur].row];
@@ -4521,6 +5364,7 @@ int core_init(int nthreads)
 		font_bold = fz_new_base14_font(ctx, "Helvetica-Bold");
 	}
 	fz_catch(ctx) return -1;
+	history_load();   /* fichiers récents de la page d'accueil */
 
 	{
 		/* Budgets proportionnels à la RAM : plus il y en a, plus on garde de tuiles
@@ -4576,10 +5420,23 @@ void core_shutdown(void)
 	tabs = NULL;
 	mutex_lock(&mu);
 	quit = 1;
+	thumb_cookie.abort = 1;
 	cond_broadcast(&cv_work);
 	cond_broadcast(&cv_load);
 	mutex_unlock(&mu);
 	for (i = 0; i < nloaders; i++) thread_join(th_loader[i]);
+	{
+		ThumbJob *lists[2] = { thumb_q, thumb_done_q }, *j;
+		for (i = 0; i < 2; i++)
+			while ((j = lists[i])) {
+				lists[i] = j->next;
+				fz_drop_display_list(ctx, j->list);
+				fz_drop_buffer(ctx, j->png);
+				free(j->path);
+				free(j);
+			}
+		thumb_q = thumb_done_q = NULL;
+	}
 	for (i = 0; i < nworkers; i++) thread_join(th_workers[i]);
 	for (i = 0; i < nworkers; i++) fz_drop_context(wctx[i]);
 	for (i = 0; i < nloaders; i++) fz_drop_context(lctx[i]);
@@ -4591,6 +5448,10 @@ void core_shutdown(void)
 	if (icon_open) gfx_tex_free(icon_open);
 	if (icon_view) gfx_tex_free(icon_view);
 	for (i = 0; i < nclosed; i++) free(closed_paths[i]);
+	for (i = 0; i < nrecent; i++) recent_free(&recents[i]);
+	free(recents);
+	recents = NULL;
+	nrecent = 0;
 	fz_drop_font(ctx, font_regular);
 	fz_drop_font(ctx, font_bold);
 	free(wq.v);

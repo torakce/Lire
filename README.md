@@ -10,6 +10,27 @@ Un seul fichier `Lire.exe`, sans installation, sans dépendance.
   Si Lire est déjà ouvert, le fichier s'ajoute **dans un nouvel onglet** de la fenêtre existante.
 - Ou en ligne de commande : `Lire.exe "C:\plans\pièce 123.pdf" "C:\plans\pièce 124.pdf"`.
 
+### Page d'accueil
+
+Quand aucun fichier n'est ouvert (Lire lancé seul, ou tous les onglets fermés), Lire affiche les **fichiers récemment
+ouverts** (40 au plus), du plus récent au plus ancien, avec une **miniature de leur première page**, leur dossier,
+la date d'ouverture et le nombre de pages.
+
+| Action | Comment |
+|---|---|
+| Rouvrir un fichier | Clic (ou clic molette) sur sa carte ; au clavier : flèches puis `Entrée` |
+| Retirer un fichier de la liste | `×` au survol de la carte, `Suppr` au clavier, ou clic droit → *Retirer de la liste* |
+| Chemin complet | Infobulle au survol ; clic droit → *Copier le chemin* ou *Afficher dans le dossier* (Explorateur) |
+| Tout effacer | Clic droit sur une carte → *Effacer tout l'historique…* (avec confirmation) |
+
+La miniature est calculée en tâche de fond depuis la page déjà analysée (aucun ralentissement, même si l'onglet est
+fermé aussitôt), et refaite quand le fichier a changé (nouvel export). Un fichier déplacé ou supprimé est signalé
+« introuvable » au clic. Rien n'est vérifié à l'affichage de la page : un partage réseau indisponible ne la bloque pas.
+Les PDF protégés par mot de passe figurent dans la liste, mais sans miniature.
+
+Historique et miniatures sont rangés dans `%LOCALAPPDATA%\Lire` (`historique.txt` et `miniatures\`) : supprimer
+ce dossier remet tout à zéro.
+
 ### Onglets
 
 Chaque fichier s'ouvre dans son propre onglet, qui garde son zoom, sa position et sa rotation.
@@ -129,7 +150,8 @@ Pendant un zoom ou un déplacement, l'image est recomposée en < 3 ms (aucun blo
 ```
 src/core.c     moteur portable : onglets, documents, mise en page, tuiles, threads, cache, zoom, navigation, interface
 src/gfx_gl.c   affichage OpenGL 1.1 (fonctionne sur tous les Windows)
-src/win32.c    fenêtre Windows, instance unique, clavier/souris, glisser-déposer, réglages (HKCU\Software\Lire)
+src/win32.c    fenêtre Windows, instance unique, clavier/souris, glisser-déposer, réglages (HKCU\Software\Lire),
+               historique et miniatures (%LOCALAPPDATA%\Lire)
 src/thread.h   threads Win32 / POSIX
 res/           icône, manifeste (haute résolution par écran), informations de version
 patches/       correctifs de performance appliqués à MuPDF (avec leur explication)
