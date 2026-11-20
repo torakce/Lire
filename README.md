@@ -5,7 +5,8 @@ Un seul fichier `Lire.exe`, sans installation, sans dépendance.
 
 ## Utilisation
 
-- Double-clic sur `Lire.exe`, puis glisser-déposer un ou plusieurs PDF dans la fenêtre (ou bouton `+` / `Ctrl+O`, sélection multiple possible).
+- Double-clic sur `Lire.exe`, puis glisser-déposer un ou plusieurs PDF dans la fenêtre, ou `Ctrl+O` (sélection multiple
+  possible), ou un clic sur un fichier récent de la page d'accueil.
 - Ou : clic droit sur un PDF → *Ouvrir avec* → `Lire.exe` (cocher « toujours utiliser » pour l'associer).
   Si Lire est déjà ouvert, le fichier s'ajoute **dans un nouvel onglet** de la fenêtre existante.
 - Ou en ligne de commande : `Lire.exe "C:\plans\pièce 123.pdf" "C:\plans\pièce 124.pdf"`.
@@ -14,7 +15,9 @@ Un seul fichier `Lire.exe`, sans installation, sans dépendance.
 
 Quand aucun fichier n'est ouvert (Lire lancé seul, ou tous les onglets fermés), Lire affiche les **fichiers récemment
 ouverts** (40 au plus), du plus récent au plus ancien, avec une **miniature de leur première page**, leur dossier,
-la date d'ouverture et le nombre de pages.
+la date d'ouverture et le nombre de pages. Le bouton `+` de la barre d'onglets (ou `Ctrl+T`) ouvre cette même page
+dans un onglet « Accueil » ; le fichier qu'on y choisit prend la place de cet onglet, comme la page « nouvel onglet »
+d'un navigateur (s'il était déjà ouvert, son onglet est simplement activé).
 
 | Action | Comment |
 |---|---|
@@ -41,6 +44,8 @@ Passer d'un onglet à l'autre est instantané : l'onglet mis en arrière-plan co
 |---|---|
 | Onglet suivant / précédent | `Ctrl+Tab` / `Ctrl+Maj+Tab` (ou `Ctrl+Pg.Suiv` / `Ctrl+Pg.Préc`) |
 | Fermer l'onglet | `Ctrl+W`, clic sur `×` ou clic molette sur l'onglet |
+| Nouvel onglet « Accueil » (fichiers récents) | Bouton `+` ou `Ctrl+T` |
+| Ouvrir un fichier (explorateur de fichiers) | `Ctrl+O` ou bouton « Ouvrir un fichier… » de l'accueil |
 | Rouvrir le dernier onglet fermé | `Ctrl+Maj+T` |
 | Ouvrir le fichier avec un autre logiciel (Acrobat, Annoter…) | Bouton en haut à droite ou `Ctrl+Maj+O` |
 | Défiler | Molette, flèches, Espace / Maj+Espace |

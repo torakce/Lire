@@ -250,6 +250,9 @@ int main(int argc, char **argv)
 			case 20: core_key('T', LMOD_CTRL | LMOD_SHIFT); break;
 			case 21: core_mouse_down(BTN_MIDDLE, x, 15, 0); core_mouse_up(BTN_MIDDLE, x, 15, 0); break;
 			}
+			/* onglet « Accueil » (Ctrl+T) de temps en temps : les clics suivants y ouvrent des fichiers récents */
+			seed = seed * 1103515245 + 12345;
+			if ((seed >> 16) % 37 == 0) core_key('T', LMOD_CTRL);
 			/* recherche (Ctrl+F) mêlée au reste */
 			seed = seed * 1103515245 + 12345;
 			if ((seed >> 16) % 17 == 0) {
@@ -528,6 +531,63 @@ int main(int argc, char **argv)
 			save("x04_rotation.png");
 		} else printf("!! rotation 90 : pas de texte trouvé\n");
 		core_shutdown();
+		return 0;
+	}
+	if (argc > 4 && !strcmp(argv[4], "onglet_accueil")) {
+		/* bouton + / Ctrl+T : onglet « Accueil » ; un fichier ouvert depuis cet onglet prend sa place */
+		const char *A = argv[5], *B = argv[6];
+		int x, y, k, vis;
+		char st[300];
+#define ETAT(msg) do { vis = core_home_card_center(0, &x, &y); printf("%-58s onglets=%d actif=%d accueil=%s  [%s]\n", msg, core_tab_count(), core_active_tab(), vis ? "oui" : "non", core_home_path(0) ? core_home_path(0) : "-"); } while (0)
+		core_open(B); pump("  B", 120);
+		core_open(A); pump("  A", 120);
+		while (core_tab_count()) core_key('W', LMOD_CTRL);
+		core_open(A); pump("  A", 120);
+		ETAT("A ouvert");
+		core_key('T', LMOD_CTRL);
+		for (k = 0; k < 3; k++) { core_poll(); core_draw(); }
+		ETAT("Ctrl+T : onglet Accueil (attendu 2 onglets, actif 1)");
+		save("t01_onglet_accueil.png");
+		core_key('T', LMOD_CTRL);
+		ETAT("Ctrl+T encore : pas de 2e onglet Accueil (attendu 2)");
+		/* carte 1 = B (A en tête) : B remplace l'onglet Accueil */
+		if (core_home_card_center(1, &x, &y)) { core_mouse_down(BTN_LEFT, x, y, 0); core_mouse_up(BTN_LEFT, x, y, 0); }
+		pump("  clic sur B", 120);
+		ETAT("clic sur B : B à la place de l'Accueil (attendu 2, actif 1)");
+		core_stats(st, sizeof st); printf("    %.60s\n", st);
+		save("t02_b_remplace.png");
+		/* Accueil puis A, déjà ouvert dans l'onglet 0 : l'Accueil se referme, A s'active */
+		core_key('T', LMOD_CTRL);
+		ETAT("Ctrl+T (attendu 3, actif 2)");
+		k = -1;
+		for (x = 0; x < core_home_count(); x++) if (!strcmp(core_home_path(x), A)) k = x;
+		if (core_home_card_center(k, &x, &y)) { core_mouse_down(BTN_LEFT, x, y, 0); core_mouse_up(BTN_LEFT, x, y, 0); }
+		ETAT("clic sur A déjà ouvert (attendu 2, actif 0)");
+		/* échec d'ouverture depuis l'Accueil : on y reste */
+		core_key('T', LMOD_CTRL);
+		core_open("testpdf/faux.pdf");
+		for (k = 0; k < 3; k++) { core_poll(); core_draw(); }
+		ETAT("fichier illisible depuis l'Accueil (attendu 3, actif 2, accueil)");
+		core_key('W', LMOD_CTRL);
+		ETAT("Ctrl+W sur l'Accueil (attendu 2)");
+		/* plus aucun onglet, puis bouton + : clic dans la barre */
+		while (core_tab_count()) core_key('W', LMOD_CTRL);
+		ETAT("tout fermé (attendu 0 onglet, accueil)");
+		for (x = 4; x < 120; x += 2) {
+			core_mouse_move(x, 17, 0);
+			core_mouse_down(BTN_LEFT, x, 17, 0); core_mouse_up(BTN_LEFT, x, 17, 0);
+			if (core_tab_count()) break;
+		}
+		ETAT("clic sur + (attendu 1 onglet Accueil)");
+		save("t03_plus.png");
+		if (core_home_card_center(0, &x, &y)) { core_mouse_down(BTN_LEFT, x, y, 0); core_mouse_up(BTN_LEFT, x, y, 0); }
+		pump("  clic sur la 1re carte", 120);
+		ETAT("ouvert depuis l'onglet Accueil (attendu 1 onglet, document)");
+		core_key(K_F1, 0);
+		save("t04_aide.png");
+		core_key(K_ESC, 0);
+		core_shutdown();
+		printf("textures restantes : %ld octets\n", soft_tex_bytes);
 		return 0;
 	}
 	if (argc > 4 && !strcmp(argv[4], "accueil")) {

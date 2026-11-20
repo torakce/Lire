@@ -153,6 +153,7 @@ struct Tab {
 	char label[200];
 	int label_w, label_px;
 	int thumb_want;                    /* miniature de la page 1 à faire dès que sa display list est prête */
+	int home;                          /* onglet « Accueil » (fichiers récents), sans document */
 };
 
 /* Miniature pour l'historique : une copie de la display list de la page 1, rendue par un
@@ -237,6 +238,7 @@ static void history_touch(Tab *t);
 static double clampd(double v, double a, double b) { return v < a ? a : v > b ? b : v; }
 static int clampi(int v, int a, int b) { return v < a ? a : v > b ? b : v; }
 static int has_doc(void) { return T && T->doc && T->npages > 0 && !T->need_password; }
+static int on_home(void) { return !T || T->home; }   /* page d'accueil : aucun onglet, ou onglet « Accueil » */
 
 static void lock_fz(void *u, int l) { (void)u; mutex_lock(&fzmu[l]); }
 static void unlock_fz(void *u, int l) { (void)u; mutex_unlock(&fzmu[l]); }
@@ -3175,7 +3177,7 @@ static void draw_tooltip(void)
 	if (hover == HIT_NONE || drag || platform_time() - hover_since < 0.5) return;
 	bar_layout(&L);
 	switch (hover) {
-	case HIT_PLUS: s = "Ouvrir un fichier  (Ctrl+O)"; x = L.plus_x0; break;
+	case HIT_PLUS: s = "Nouvel onglet : fichiers r\xc3\xa9""cents  (Ctrl+T)"; x = L.plus_x0; break;
 	case HIT_OPENWITH: s = "Ouvrir avec un autre logiciel  (Ctrl+Maj+O)"; x = L.ow_x0; break;
 	case HIT_VIEW: s = "Affichage : une ou deux pages, continu ou page par page  (D, Maj+D, C)"; x = L.vm_x0; break;
 	case HIT_ROT_CCW: s = "Rotation antihoraire  (Maj+R)"; x = L.ccw_x0; break;
@@ -3185,7 +3187,7 @@ static void draw_tooltip(void)
 			s = "Fermer l'onglet  (Ctrl+W)";
 			x = tab_x(&L, hover - HIT_CLOSE) + L.tab_w - 30 * ui;
 		} else if (hover >= HIT_TAB && hover - HIT_TAB < ntabs) {
-			snprintf(buf, sizeof buf, "%s", tabs[hover - HIT_TAB]->path);
+			snprintf(buf, sizeof buf, "%s", tabs[hover - HIT_TAB]->path ? tabs[hover - HIT_TAB]->path : "Fichiers r\xc3\xa9""cemment ouverts");
 			s = buf;
 			x = tab_x(&L, hover - HIT_TAB);
 		} else return;
@@ -3375,7 +3377,8 @@ static void draw_pages(void)
 }
 
 static const char *help_lines[][2] = {
-	{ "Ouvrir un fichier (nouvel onglet)", "Ctrl+O, bouton +  ou glisser-d\xc3\xa9poser" },
+	{ "Nouvel onglet (fichiers r\xc3\xa9""cents)", "Ctrl+T  ou bouton +" },
+	{ "Ouvrir un fichier", "Ctrl+O  ou glisser-d\xc3\xa9poser" },
 	{ "Onglet suivant / pr\xc3\xa9""c\xc3\xa9""dent", "Ctrl+Tab / Ctrl+Maj+Tab" },
 	{ "Fermer l'onglet", "Ctrl+W  ou clic molette sur l'onglet" },
 	{ "Rouvrir l'onglet ferm\xc3\xa9", "Ctrl+Maj+T" },
@@ -4127,7 +4130,7 @@ int core_home_card_center(int i, int *x, int *y)
 {
 	HomeLayout L;
 	float cx, cy;
-	if (T || i < 0 || i >= nrecent) return 0;
+	if (!on_home() || i < 0 || i >= nrecent) return 0;
 	home_layout(&L);
 	card_pos(&L, i, &cx, &cy);
 	*x = (int)(cx + L.cw / 2);
@@ -4152,7 +4155,7 @@ static void draw_overlays(void)
 	int px = (int)(13 * ui);
 	double t = platform_time();
 
-	if (!T) draw_home();
+	if (on_home()) draw_home();
 
 	if (drag == DRAG_AUTO) {
 		int s = (int)lround(30 * ui);
@@ -4379,7 +4382,7 @@ void core_draw(void)
 	}
 	gfx_begin(win_w, win_h, BG_COLOR);
 	gfx_origin(0, (float)bar_h);
-	if (T && home_textures) home_free_textures();
+	if (!on_home() && home_textures) home_free_textures();
 	if (has_doc()) {
 		promo_deadline = platform_time() + 0.010;
 		draw_pages();
@@ -4410,7 +4413,7 @@ int core_timeout_ms(void)
 		int h = (int)((0.5 - (t - hover_since)) * 1000) + 20;
 		if (ms < 0 || h < ms) ms = h;
 	}
-	if (!T && home_hover >= HH_CARD && home_hover < HH_REMOVE && t - home_hover_since < 0.6) {
+	if (on_home() && home_hover >= HH_CARD && home_hover < HH_REMOVE && t - home_hover_since < 0.6) {
 		int h = (int)((0.6 - (t - home_hover_since)) * 1000) + 20;
 		if (ms < 0 || h < ms) ms = h;
 	}
@@ -4585,14 +4588,66 @@ static void open_failed(int idx, const char *what)
 	set_toast(msg);
 }
 
-void core_open(const char *path)
+static int tab_index(Tab *t)
+{
+	int i;
+	for (i = 0; i < ntabs; i++)
+		if (tabs[i] == t) return i;
+	return -1;
+}
+
+/* Onglet « Accueil » (bouton + ou Ctrl+T) : un seul à la fois ; un fichier ouvert depuis
+   cet onglet prend sa place, comme la page « nouvel onglet » d'un navigateur. */
+static void new_home_tab(void)
 {
 	Tab *t;
+	int i;
+	for (i = 0; i < ntabs; i++)
+		if (tabs[i]->home) { activate(i); return; }
+	t = calloc(1, sizeof *t);
+	t->home = 1;
+	t->name = strdup("Accueil");
+	t->scale = 1;
+	t->fit_mode = FIT_PAGE;
+	t->exact_level = INT_MIN;
+	t->label_w = -1;
+	if (ntabs == tabs_cap) {
+		tabs_cap = tabs_cap ? tabs_cap * 2 : 8;
+		tabs = realloc(tabs, tabs_cap * sizeof *tabs);
+	}
+	tabs[ntabs++] = t;
+	home_scroll = 0;
+	home_hover = HH_NONE;
+	home_kbd = 0;
+	activate(ntabs - 1);
+}
+
+/* le document ouvert (onglet actif) prend la place de l'onglet « Accueil » d'où il a été ouvert */
+static void take_home_slot(Tab *home)
+{
+	int h = home ? tab_index(home) : -1, a;
+	Tab *n;
+	if (h < 0 || h == active) return;
+	close_tab(h);
+	a = active;
+	if (a < 0 || a <= h) return;
+	n = tabs[a];
+	memmove(tabs + h + 1, tabs + h, (size_t)(a - h) * sizeof *tabs);
+	tabs[h] = n;
+	active = h;
+	ensure_tab_visible = 1;
+	dirty = 1;
+}
+
+void core_open(const char *path)
+{
+	Tab *t, *home = T && T->home ? T : NULL;
 	int i;
 	fz_document *d = NULL;
 	for (i = 0; i < ntabs; i++)
 		if (tabs[i]->path && same_path(tabs[i]->path, path)) {
 			activate(i);
+			take_home_slot(home);   /* déjà ouvert : l'onglet « Accueil » se referme */
 			return;
 		}
 	fz_var(d);
@@ -4626,10 +4681,15 @@ void core_open(const char *path)
 		input_mode = INPUT_PASSWORD;
 		input_buf[0] = 0;
 		dirty = 1;
+		take_home_slot(home);
 		return;
 	}
-	if (finish_open())
+	if (finish_open()) {
 		open_failed(active, "Aucune page lisible dans");
+		if (home && (i = tab_index(home)) >= 0) activate(i);   /* échec : on reste sur l'accueil */
+		return;
+	}
+	take_home_slot(home);
 }
 
 void core_reload(void)
@@ -4873,7 +4933,7 @@ void core_mouse_down(int btn, int x, int y, int mods)
 		else if (btn == BTN_LEFT) {
 			if (h >= HIT_CLOSE) close_tab(h - HIT_CLOSE);
 			else if (h >= HIT_TAB) activate(h - HIT_TAB);
-			else if (h == HIT_PLUS) platform_open_dialog();
+			else if (h == HIT_PLUS) new_home_tab();
 			else if (h == HIT_OPENWITH) open_with();
 			else if (h == HIT_VIEW) view_menu();
 			else if (h == HIT_ROT_CCW) rotate(-90);
@@ -4897,7 +4957,7 @@ void core_mouse_down(int btn, int x, int y, int mods)
 			return;
 		}
 	}
-	if (!T) { home_mouse_down(btn, x, y); return; }
+	if (on_home()) { home_mouse_down(btn, x, y); return; }
 	if (!has_doc()) {
 		if (btn == BTN_LEFT) platform_open_dialog();
 		return;
@@ -4949,7 +5009,7 @@ void core_mouse_move(int x, int y, int mods)
 	y -= bar_h;
 	dx = x - mx; dy = y - my;
 	mx = x; my = y;
-	if (!T) { home_mouse_move(x, y); return; }
+	if (on_home()) { home_mouse_move(x, y); return; }
 	if (!has_doc()) return;
 	switch (drag) {
 	case DRAG_PAN:
@@ -5050,7 +5110,7 @@ void core_wheel(float dy, float dx, int x, int y, int mods)
 		return;
 	}
 	y -= bar_h;
-	if (!T) {
+	if (on_home()) {
 		home_scroll -= dy * 110 * ui;
 		home_clamp_scroll();
 		home_mouse_move(x, y);
@@ -5078,7 +5138,7 @@ void core_key(int key, int mods)
 		case K_PGDN: next_tab(1); return;
 		case K_PGUP: next_tab(-1); return;
 		case 'W': case K_F4: if (T) close_tab(active); return;
-		case 'T': if (shift) reopen_closed(); else platform_open_dialog(); return;
+		case 'T': if (shift) reopen_closed(); else new_home_tab(); return;
 		case 'O': if (shift) open_with(); else platform_open_dialog(); return;
 		case 'F': if (input_mode != INPUT_PASSWORD) { if (input_mode == INPUT_GOTO) input_mode = INPUT_NONE; find_open(); } return;
 		case 'V':
@@ -5190,7 +5250,7 @@ shortcuts:
 	case K_F11: platform_toggle_fullscreen(); return;
 	case K_ESC: show_help = 0; toast[0] = 0; clear_selection(); return;
 	}
-	if (!T) { home_key(key); return; }
+	if (on_home()) { home_key(key); return; }
 	if (!has_doc()) return;
 	cur = current_page();
 	row = &T->rows[T->pages[cur].row];
